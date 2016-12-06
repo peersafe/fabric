@@ -2,7 +2,7 @@
 The hyperledger fabric ordering service is intended to provide an atomic broadcast ordering service for consumption by the peers.  This means that many clients may submit messages for ordering, and all clients are delivered the same series of ordered batches in response.
 
 ## Protocol definition
-The atomic broadcast ordering protocol for hyperledger fabric is described in `hyperledger/fabric/orderer/atomicbroadcast/ab.proto`.  There are two services, the `Broadcast` service for injecting messages into the system, and the `Deliver` service for receiving ordered batches from the service.  Sometimes, the service will reside over the network, while othertimes, the service may be bound locally into a peer process.  The service may be bound locally for single process development deployments, or when the underlying ordering service has its own backing network protocol and the proto serves only as a wrapper.
+The atomic broadcast ordering protocol for hyperledger fabric is described in `hyperledger/fabric/protos/orderer/ab.proto`.  There are two services, the `Broadcast` service for injecting messages into the system, and the `Deliver` service for receiving ordered batches from the service.  Sometimes, the service will reside over the network, while othertimes, the service may be bound locally into a peer process.  The service may be bound locally for single process development deployments, or when the underlying ordering service has its own backing network protocol and the proto serves only as a wrapper.
 
 ## Service types
 * Solo Orderer:
@@ -29,3 +29,9 @@ There are currently no other raw ledgers available, although it is anticipated t
 To experiment with the orderer service you may build the orderer binary by simply typing `go build` in the `hyperledger/fabric/orderer` directory.  You may then invoke the orderer binary with no parameters, or you can override the bind address, port, and backing ledger by setting the environment variables `ORDERER_LISTEN_ADDRESS`, `ORDERER_LISTEN_PORT` and `ORDERER_LEDGER_TYPE` respectively.  Presently, only the solo orderer is supported.  The deployment and configuration is very stopgap at this point, so expect for this to change noticably in the future.
 
 There are sample clients in the `fabric/orderer/sample_clients` directory.  The `broadcast_timestamp` client sends a message containing the timestamp to the `Broadcast` service.  The `deliver_stdout` client prints received batches to stdout from the `Deliver` interface.  These may both be build simply by typing `go build` in their respective directories.  Neither presently supports config, so editing the source manually to adjust address and port is required.
+
+### Profiling
+
+Profiling the orderer service is possible through a standard HTTP interface documented [here](https://golang.org/pkg/net/http/pprof). The profiling service can be configured using the **config.yaml** file, or through environment variables. To enable profiling set `ORDERER_GENERAL_PROFILE_ENABLED=true`, and optionally set `ORDERER_GENERAL_PROFILE_ADDRESS` to the desired network address for the profiling service. The default address is `0.0.0.0:6060` as in the Golang documentation.
+
+Note that failures of the profiling service, either at startup or anytime during the run, will cause the overall orderer service to fail. Therefore it is currently not recommended to enable profiling in production settings.

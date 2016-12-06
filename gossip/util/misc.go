@@ -17,8 +17,10 @@ limitations under the License.
 package util
 
 import (
+	"fmt"
 	"math/rand"
 	"reflect"
+	"runtime"
 	"sync"
 )
 
@@ -117,4 +119,15 @@ func (s *Set) Remove(item interface{}) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	delete(s.items, item)
+}
+
+type goroutine struct {
+	id    int64
+	Stack []string
+}
+
+func PrintStackTrace() {
+	buf := make([]byte, 1<<16)
+	runtime.Stack(buf, true)
+	fmt.Printf("%s", buf)
 }

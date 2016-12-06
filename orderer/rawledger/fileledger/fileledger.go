@@ -20,12 +20,16 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"reflect"
+	"sync"
 
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
 	"github.com/hyperledger/fabric/orderer/rawledger"
+	cb "github.com/hyperledger/fabric/protos/common"
+	ab "github.com/hyperledger/fabric/protos/orderer"
+	"github.com/op/go-logging"
 
 	"github.com/golang/protobuf/jsonpb"
-	"github.com/op/go-logging"
+	"github.com/golang/protobuf/proto"
 )
 
 var logger = logging.MustGetLogger("rawledger/fileledger")
@@ -53,24 +57,105 @@ type fileLedger struct {
 	marshaler      *jsonpb.Marshaler
 }
 
-// New creates a new instance of the file ledger
-func New(directory string) rawledger.ReadWriter {
+type fileLedgerFactory struct {
+	directory string
+	ledgers   map[string]rawledger.ReadWriter
+	mutex     sync.Mutex
+}
+
+func New(directory string, systemGenesis *cb.Block) (rawledger.Factory, rawledger.ReadWriter) {
+	env := &cb.Envelope{}
+	err := proto.Unmarshal(systemGenesis.Data.Data[0], env)
+	if err != nil {
+		logger.Fatalf("Bad envelope in genesis block: %s", err)
+	}
+
+	payload := &cb.Payload{}
+	err = proto.Unmarshal(env.Payload, payload)
+	if err != nil {
+		logger.Fatalf("Bad payload in genesis block: %s", err)
+	}
+
 	logger.Debugf("Initializing fileLedger at '%s'", directory)
 	if err := os.MkdirAll(directory, 0700); err != nil {
-		panic(err)
+		logger.Fatalf("Could not create directory %s: %s", directory, err)
 	}
+
+	flf := &fileLedgerFactory{
+		directory: directory,
+		ledgers:   make(map[string]rawledger.ReadWriter),
+	}
+
+	flt, err := flf.GetOrCreate(payload.Header.ChainHeader.ChainID)
+	if err != nil {
+		logger.Fatalf("Error getting orderer system chain dir: %s", err)
+	}
+
+	fl := flt.(*fileLedger)
+
+	if fl.height > 0 {
+		block, ok := fl.readBlock(0)
+		if !ok {
+			logger.Fatalf("Error reading genesis block for chain of height %d", fl.height)
+		}
+		if !reflect.DeepEqual(block, systemGenesis) {
+			logger.Fatalf("Attempted to reconfigure an existing ordering system chain with new genesis block")
+		}
+	} else {
+		fl.writeBlock(systemGenesis)
+		fl.height = 1
+		fl.lastHash = systemGenesis.Header.Hash()
+	}
+
+	return flf, fl
+}
+
+func (flf *fileLedgerFactory) ChainIDs() []string {
+	flf.mutex.Lock()
+	defer flf.mutex.Unlock()
+	ids := make([]string, len(flf.ledgers))
+
+	i := 0
+	for key := range flf.ledgers {
+		ids[i] = key
+		i++
+	}
+
+	return ids
+}
+
+func (flf *fileLedgerFactory) GetOrCreate(chainID string) (rawledger.ReadWriter, error) {
+	flf.mutex.Lock()
+	defer flf.mutex.Unlock()
+
+	key := chainID
+
+	// Check a second time with the lock held
+	l, ok := flf.ledgers[key]
+	if ok {
+		return l, nil
+	}
+
+	directory := fmt.Sprintf("%s/%s", flf.directory, chainID)
+
+	logger.Debugf("Initializing chain at '%s'", directory)
+
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return nil, err
+	}
+
+	ch := newChain(directory)
+	flf.ledgers[key] = ch
+	return ch, nil
+}
+
+// newChain creates a new chain backed by a file ledger
+func newChain(directory string) rawledger.ReadWriter {
 	fl := &fileLedger{
 		directory:      directory,
 		fqFormatString: directory + "/" + blockFileFormatString,
 		signal:         make(chan struct{}),
 		marshaler:      &jsonpb.Marshaler{Indent: "  "},
-	}
-	genesisBlock := &ab.Block{
-		Number:   0,
-		PrevHash: []byte("GENESIS"),
-	}
-	if _, err := os.Stat(fl.blockFilename(genesisBlock.Number)); os.IsNotExist(err) {
-		fl.writeBlock(genesisBlock)
 	}
 	fl.initializeBlockHeight()
 	logger.Debugf("Initialized to block height %d with hash %x", fl.height-1, fl.lastHash)
@@ -99,6 +184,9 @@ func (fl *fileLedger) initializeBlockHeight() {
 		nextNumber++
 	}
 	fl.height = nextNumber
+	if fl.height == 0 {
+		return
+	}
 	block, found := fl.readBlock(fl.height - 1)
 	if !found {
 		panic(fmt.Errorf("Block %d was in directory listing but error reading", fl.height-1))
@@ -106,7 +194,7 @@ func (fl *fileLedger) initializeBlockHeight() {
 	if block == nil {
 		panic(fmt.Errorf("Error reading block %d", fl.height-1))
 	}
-	fl.lastHash = block.Hash()
+	fl.lastHash = block.Header.Hash()
 }
 
 // blockFilename returns the fully qualified path to where a block of a given number should be stored on disk
@@ -115,14 +203,14 @@ func (fl *fileLedger) blockFilename(number uint64) string {
 }
 
 // writeBlock commits a block to disk
-func (fl *fileLedger) writeBlock(block *ab.Block) {
-	file, err := os.Create(fl.blockFilename(block.Number))
+func (fl *fileLedger) writeBlock(block *cb.Block) {
+	file, err := os.Create(fl.blockFilename(block.Header.Number))
 	if err != nil {
 		panic(err)
 	}
 	defer file.Close()
 	err = fl.marshaler.Marshal(file, block)
-	logger.Debugf("Wrote block %d", block.Number)
+	logger.Debugf("Wrote block %d", block.Header.Number)
 	if err != nil {
 		panic(err)
 	}
@@ -130,16 +218,16 @@ func (fl *fileLedger) writeBlock(block *ab.Block) {
 }
 
 // readBlock returns the block or nil, and whether the block was found or not, (nil,true) generally indicates an irrecoverable problem
-func (fl *fileLedger) readBlock(number uint64) (*ab.Block, bool) {
+func (fl *fileLedger) readBlock(number uint64) (*cb.Block, bool) {
 	file, err := os.Open(fl.blockFilename(number))
 	if err == nil {
 		defer file.Close()
-		block := &ab.Block{}
+		block := &cb.Block{}
 		err = jsonpb.Unmarshal(file, block)
 		if err != nil {
 			return nil, true
 		}
-		logger.Debugf("Read block %d", block.Number)
+		logger.Debugf("Read block %d", block.Header.Number)
 		return block, true
 	}
 	return nil, false
@@ -151,12 +239,29 @@ func (fl *fileLedger) Height() uint64 {
 }
 
 // Append creates a new block and appends it to the ledger
-func (fl *fileLedger) Append(messages []*ab.BroadcastMessage, proof []byte) *ab.Block {
-	block := &ab.Block{
-		Number:   fl.height,
-		PrevHash: fl.lastHash,
-		Messages: messages,
-		Proof:    proof,
+func (fl *fileLedger) Append(messages []*cb.Envelope, metadata [][]byte) *cb.Block {
+	data := &cb.BlockData{
+		Data: make([][]byte, len(messages)),
+	}
+
+	var err error
+	for i, msg := range messages {
+		data.Data[i], err = proto.Marshal(msg)
+		if err != nil {
+			logger.Fatalf("Error marshaling what should be a valid proto message: %s", err)
+		}
+	}
+
+	block := &cb.Block{
+		Header: &cb.BlockHeader{
+			Number:       fl.height,
+			PreviousHash: fl.lastHash,
+			DataHash:     data.Hash(),
+		},
+		Data: data,
+		Metadata: &cb.BlockMetadata{
+			Metadata: metadata,
+		},
 	}
 	fl.writeBlock(block)
 	fl.height++
@@ -185,16 +290,16 @@ func (fl *fileLedger) Iterator(startType ab.SeekInfo_StartType, specified uint64
 }
 
 // Next blocks until there is a new block available, or returns an error if the next block is no longer retrievable
-func (cu *cursor) Next() (*ab.Block, ab.Status) {
+func (cu *cursor) Next() (*cb.Block, cb.Status) {
 	// This only loops once, as signal reading indicates the new block has been written
 	for {
 		block, found := cu.fl.readBlock(cu.blockNumber)
 		if found {
 			if block == nil {
-				return nil, ab.Status_SERVICE_UNAVAILABLE
+				return nil, cb.Status_SERVICE_UNAVAILABLE
 			}
 			cu.blockNumber++
-			return block, ab.Status_SUCCESS
+			return block, cb.Status_SUCCESS
 		}
 		<-cu.fl.signal
 	}

@@ -29,20 +29,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hyperledger/fabric/consensus/helper"
 	"github.com/hyperledger/fabric/core"
 	"github.com/hyperledger/fabric/core/chaincode"
 	"github.com/hyperledger/fabric/core/comm"
 	"github.com/hyperledger/fabric/core/committer/noopssinglechain"
 	"github.com/hyperledger/fabric/core/crypto"
-	"github.com/hyperledger/fabric/core/db"
+	"github.com/hyperledger/fabric/core/crypto/primitives"
 	"github.com/hyperledger/fabric/core/endorser"
-	"github.com/hyperledger/fabric/core/ledger/genesis"
 	"github.com/hyperledger/fabric/core/peer"
-	"github.com/hyperledger/fabric/core/rest"
-	"github.com/hyperledger/fabric/core/system_chaincode"
+	"github.com/hyperledger/fabric/core/util"
 	"github.com/hyperledger/fabric/events/producer"
-	pb "github.com/hyperledger/fabric/protos"
+	pb "github.com/hyperledger/fabric/protos/peer"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
@@ -122,8 +119,6 @@ func serve(args []string) error {
 		logger.Infof("Privacy enabled status: false")
 	}
 
-	db.Start()
-
 	var opts []grpc.ServerOption
 	if comm.TLSEnabled() {
 		creds, err := credentials.NewServerTLSFromFile(viper.GetString("peer.tls.cert.file"),
@@ -137,80 +132,30 @@ func serve(args []string) error {
 
 	grpcServer := grpc.NewServer(opts...)
 
-	secHelper, err := getSecHelper()
-	if err != nil {
-		return err
-	}
+	/******this will go away when we implement join command*****/
+	chainID := util.GetTestChainID()
 
-	secHelperFunc := func() crypto.Peer {
-		return secHelper
-	}
+	registerChaincodeSupport(chainID, grpcServer)
 
-	registerChaincodeSupport(chaincode.DefaultChain, grpcServer, secHelper)
-
-	var peerServer *peer.Impl
-
-	// Create the peerServer
-	if peer.ValidatorEnabled() {
-		logger.Debug("Running as validating peer - making genesis block if needed")
-		makeGenesisError := genesis.MakeGenesis()
-		if makeGenesisError != nil {
-			return makeGenesisError
-		}
-		logger.Debugf("Running as validating peer - installing consensus %s",
-			viper.GetString("peer.validator.consensus"))
-
-		peerServer, err = peer.NewPeerWithEngine(secHelperFunc, helper.GetEngine)
-	} else {
-		logger.Debug("Running as non-validating peer")
-		peerServer, err = peer.NewPeerWithHandler(secHelperFunc, peer.NewPeerHandler)
-	}
-
-	if err != nil {
-		logger.Fatalf("Failed creating new peer with handler %v", err)
-
-		return err
-	}
-
-	// Register the Peer server
-	pb.RegisterPeerServer(grpcServer, peerServer)
+	logger.Debugf("Running peer")
 
 	// Register the Admin server
 	pb.RegisterAdminServer(grpcServer, core.NewAdminServer())
 
-	// Register Devops server
-	serverDevops := core.NewDevopsServer(peerServer)
-	pb.RegisterDevopsServer(grpcServer, serverDevops)
-
-	// Register the ServerOpenchain server
-	serverOpenchain, err := rest.NewOpenchainServerWithPeerInfo(peerServer)
-	if err != nil {
-		err = fmt.Errorf("Error creating OpenchainServer: %s", err)
-		return err
-	}
-
-	pb.RegisterOpenchainServer(grpcServer, serverOpenchain)
-
-	// Create and register the REST service if configured
-	if viper.GetBool("rest.enabled") {
-		go rest.StartOpenchainRESTServer(serverOpenchain, serverDevops)
-	}
-
 	// Register the Endorser server
-	serverEndorser := endorser.NewEndorserServer(peerServer)
+	serverEndorser := endorser.NewEndorserServer()
 	pb.RegisterEndorserServer(grpcServer, serverEndorser)
 
-	// !!!IMPORTANT!!! - as mentioned in core.yaml, peer-orderer-committer
-	// interaction is closely tied to bootstrapping. This is to be viewed
-	// as temporary implementation to test the end-to-end flows in the
-	// system outside of multi-ledger, multi-channel work
-	if committer := noopssinglechain.NewCommitter(); committer != nil {
-		go func() {
-			if err := committer.Start(); err != nil {
-				fmt.Printf("Could not start solo committer(%s), continuing without committer\n", err)
-			}
-		}()
+	//this shoul not need the chainID. Delivery should be
+	//split up into network part and chain part. This should
+	//only init the network part...TBD, part of Join work
+	deliverService := noopssinglechain.NewDeliverService(chainID, peerEndpoint.Address, grpcServer)
+
+	if deliverService != nil {
+		deliverService.Start()
 	}
+
+	defer noopssinglechain.StopDeliveryService(deliverService)
 
 	logger.Infof("Starting peer with ID=%s, network ID=%s, address=%s, rootnodes=%v, validator=%v",
 		peerEndpoint.ID, viper.GetString("peer.networkId"), peerEndpoint.Address,
@@ -262,9 +207,10 @@ func serve(args []string) error {
 	return <-serve
 }
 
-func registerChaincodeSupport(chainname chaincode.ChainName, grpcServer *grpc.Server,
-	secHelper crypto.Peer) {
-
+//NOTE - when we implment JOIN we will no longer pass the chainID as param
+//The chaincode support will come up without registering system chaincodes
+//which will be registered only during join phase.
+func registerChaincodeSupport(chainID string, grpcServer *grpc.Server) {
 	//get user mode
 	userRunsCC := false
 	if viper.GetString("chaincode.mode") == chaincode.DevModeUserRunsChaincode {
@@ -279,11 +225,10 @@ func registerChaincodeSupport(chainname chaincode.ChainName, grpcServer *grpc.Se
 	}
 	ccStartupTimeout := time.Duration(tOut) * time.Millisecond
 
-	ccSrv := chaincode.NewChaincodeSupport(chainname, peer.GetPeerEndpoint, userRunsCC,
-		ccStartupTimeout, secHelper)
+	ccSrv := chaincode.NewChaincodeSupport(peer.GetPeerEndpoint, userRunsCC, ccStartupTimeout)
 
 	//Now that chaincode is initialized, register all system chaincodes.
-	system_chaincode.RegisterSysCCs()
+	chaincode.RegisterSysCCs(chainID)
 
 	pb.RegisterChaincodeSupportServer(grpcServer, ccSrv)
 }
@@ -364,34 +309,9 @@ var once sync.Once
 //NOTE- this crypto func might rightly belong in a crypto package
 //and universally accessed
 func getSecHelper() (crypto.Peer, error) {
-	var secHelper crypto.Peer
-	var err error
+	//TODO:  integrated new crypto / idp code
 	once.Do(func() {
-		if core.SecurityEnabled() {
-			enrollID := viper.GetString("security.enrollID")
-			enrollSecret := viper.GetString("security.enrollSecret")
-			if peer.ValidatorEnabled() {
-				logger.Debugf("Registering validator with enroll ID: %s", enrollID)
-				if err = crypto.RegisterValidator(enrollID, nil, enrollID, enrollSecret); nil != err {
-					return
-				}
-				logger.Debugf("Initializing validator with enroll ID: %s", enrollID)
-				secHelper, err = crypto.InitValidator(enrollID, nil)
-				if nil != err {
-					return
-				}
-			} else {
-				logger.Debugf("Registering non-validator with enroll ID: %s", enrollID)
-				if err = crypto.RegisterPeer(enrollID, nil, enrollID, enrollSecret); nil != err {
-					return
-				}
-				logger.Debugf("Initializing non-validator with enroll ID: %s", enrollID)
-				secHelper, err = crypto.InitPeer(enrollID, nil)
-				if nil != err {
-					return
-				}
-			}
-		}
+		primitives.SetSecurityLevel("SHA2", 256)
 	})
-	return secHelper, err
+	return nil, nil
 }

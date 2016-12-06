@@ -1,5 +1,6 @@
 ###############################################################################
 #
+#
 #    CLI section
 #
 ###############################################################################
@@ -20,7 +21,7 @@ rest:
     # Enable/disable setting for the REST service. It is recommended to disable
     # REST service on validators in production deployment and use non-validating
     # nodes to host REST service
-    enabled: true
+    enabled: false
 
     # The address that the REST service will listen on for incoming requests.
     address: 0.0.0.0:7050
@@ -68,6 +69,7 @@ logging:
     network:   warning
     chaincode: warning
     version: warning
+    protoutils: debug
 
 ###############################################################################
 #
@@ -98,6 +100,12 @@ peer:
     # Setting for runtime.GOMAXPROCS(n). If n < 1, it does not change the current setting
     gomaxprocs: -1
     workers: 2
+
+    # Gossip related configuration
+    gossip:
+        bootstrap: 0.0.0.0:7051
+        # For debug - is peer is its org leader and should pass blocks from orderer to other peers in org
+        orgLeader: true
 
     # Sync related configuration
     sync:
@@ -165,7 +173,7 @@ peer:
         enabled: true
         ledger:
             # orderer to talk to
-            orderer: 127.0.0.1:5005
+            orderer: 0.0.0.0:7050
 
     # TLS Settings for p2p communications
     tls:
@@ -227,11 +235,6 @@ peer:
 
     # Path on the file system where peer will store data
     fileSystemPath: /var/hyperledger/production
-    # rocksdb configurations
-    db:
-        maxLogFileSize: 10485760
-        keepLogFileNum: 10
-        logLevel: "warn"
 
     profile:
         enabled:     false
@@ -343,7 +346,7 @@ chaincode:
     # A value <= 0 turns keepalive off
     keepalive: 0
 
-    # system chaincodes whitelist. To add system chaincode "myscc" to the  
+    # system chaincodes whitelist. To add system chaincode "myscc" to the
     # whitelist, add "myscc: enable" to the list
     system:
         lccc: enable
@@ -397,6 +400,20 @@ ledger:
         # configurations for 'trie'
         # 'tire' has no additional configurations exposed as yet
 
+    # stateDatabase - options are "goleveldb", "CouchDB"
+    # goleveldb - default state database stored in goleveldb.
+    # CouchDB - store state database in CouchDB
+    stateDatabase: goleveldb
+    couchDBConfig:
+       couchDBAddress: 127.0.0.1:5984
+       username:
+       password:
+    # historyDatabase - options are true or false
+    # Indicates if the transaction history should be stored in 
+    # a querable database such as "CouchDB".
+    # The stateDatabase must be also stored in CouchDB for 
+    # history to be enabled.
+    historyDatabase: false
 
 ###############################################################################
 #

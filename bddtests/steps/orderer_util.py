@@ -23,7 +23,8 @@ import subprocess
 import devops_pb2
 import fabric_pb2
 import chaincode_pb2
-import ab_pb2
+from orderer import ab_pb2
+from common import common_pb2
 
 import bdd_test_util
 import bdd_grpc_util
@@ -32,6 +33,7 @@ from grpc.beta import implementations
 from grpc.framework.interfaces.face.face import NetworkError
 from grpc.framework.interfaces.face.face import AbortionError
 from grpc.beta.interfaces import StatusCode
+from common.common_pb2 import Payload
 
 
 class StreamHelper:
@@ -122,7 +124,7 @@ class DeliverStreamHelper(StreamHelper):
                 numToRead = self.getWindowSize() if self.getWindowSize() < expectedCount else expectedCount
                 msgsRead.extend(self.readMessages(numToRead))
                 # send the ack
-                self.sendAcknowledgment(msgsRead[-1].Block.Number)
+                self.sendAcknowledgment(msgsRead[-1].Block.Header.Number)
                 print('SentACK!!')
                 print('')
             return msgsRead
@@ -221,15 +223,20 @@ def createDeliverUpdateMsg(Start, SpecifiedNumber, WindowSize):
 
 
 def generateBroadcastMessages(numToGenerate = 1, timeToHoldOpen = 1):
-	messages = []
-	for i in range(0, numToGenerate):
-		messages.append(ab_pb2.BroadcastMessage(Data = str("BDD test: {0}".format(datetime.datetime.utcnow()))))
-	for msg in messages:
-		yield msg
-	time.sleep(timeToHoldOpen)
+    messages = []
+    for i in range(0, numToGenerate):
+        envelope = common_pb2.Envelope()
+        payload = common_pb2.Payload(header = common_pb2.Header(chainHeader = common_pb2.ChainHeader()))
+        # TODO, appropriately set the header type
+        payload.data = str("BDD test: {0}".format(datetime.datetime.utcnow()))
+        envelope.payload = payload.SerializeToString()
+        messages.append(envelope)
+    for msg in messages:
+        yield msg
+    time.sleep(timeToHoldOpen)
 
 
 def getGRPCChannel(ipAddress):
-    channel = implementations.insecure_channel(ipAddress, 5005)
+    channel = implementations.insecure_channel(ipAddress, 7050)
     print("Returning GRPC for address: {0}".format(ipAddress))
     return channel

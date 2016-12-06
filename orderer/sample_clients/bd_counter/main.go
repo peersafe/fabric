@@ -22,7 +22,7 @@ import (
 	"os/signal"
 	"strings"
 
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
+	ab "github.com/hyperledger/fabric/protos/orderer"
 	logging "github.com/op/go-logging"
 	"google.golang.org/grpc"
 )
@@ -54,7 +54,7 @@ func main() {
 	flag.StringVar(&client.config.rpc, "rpc", "broadcast",
 		"The RPC that this client is requesting.")
 	flag.StringVar(&client.config.server, "server",
-		"127.0.0.1:5151", "The RPC server to connect to.")
+		"127.0.0.1:7050", "The RPC server to connect to.")
 	flag.IntVar(&client.config.count, "count", 100,
 		"When in broadcast mode, how many messages to send.")
 	flag.StringVar(&loglevel, "loglevel", "info",

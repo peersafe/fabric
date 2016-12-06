@@ -20,16 +20,15 @@ import (
 	"testing"
 	"time"
 
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
+	ab "github.com/hyperledger/fabric/protos/orderer"
 )
 
-/* Disabling this until the upgrade to Go 1.7 kicks in
 func TestClientDeliverSeekWrong(t *testing.T) {
 	t.Run("out-of-range-1", testClientDeliverSeekWrongFunc(uint64(oldestOffset)-1, 10))
 	t.Run("out-of-range-2", testClientDeliverSeekWrongFunc(uint64(newestOffset), 10))
 	t.Run("bad-window-1", testClientDeliverSeekWrongFunc(uint64(oldestOffset), 0))
 	t.Run("bad-window-2", testClientDeliverSeekWrongFunc(uint64(oldestOffset), uint64(testConf.General.MaxWindowSize+1)))
-} */
+}
 
 func testClientDeliverSeekWrongFunc(seek, window uint64) func(t *testing.T) {
 	return func(t *testing.T) {
@@ -64,12 +63,11 @@ func testClientDeliverSeekWrongFunc(seek, window uint64) func(t *testing.T) {
 	}
 }
 
-/* Disabling this until the upgrade to Go 1.7 kicks in
 func TestClientDeliverSeek(t *testing.T) {
 	t.Run("oldest", testClientDeliverSeekFunc("oldest", 0, 10, 10))
 	t.Run("in-between", testClientDeliverSeekFunc("specific", uint64(middleOffset), 10, 10))
 	t.Run("newest", testClientDeliverSeekFunc("newest", 0, 10, 1))
-} */
+}
 
 func testClientDeliverSeekFunc(label string, seek, window uint64, expected int) func(*testing.T) {
 	return func(t *testing.T) {
@@ -105,11 +103,10 @@ func testClientDeliverSeekFunc(label string, seek, window uint64, expected int) 
 	}
 }
 
-/* Disabling this until the upgrade to Go 1.7 kicks in
 func TestClientDeliverAckWrong(t *testing.T) {
 	t.Run("out-of-range-ack-1", testClientDeliverAckWrongFunc(uint64(middleOffset)-2))
 	t.Run("out-of-range-ack-2", testClientDeliverAckWrongFunc(uint64(newestOffset)))
-} */
+}
 
 func testClientDeliverAckWrongFunc(ack uint64) func(t *testing.T) {
 	return func(t *testing.T) {
@@ -143,11 +140,10 @@ func testClientDeliverAckWrongFunc(ack uint64) func(t *testing.T) {
 	}
 }
 
-/* Disabling this until the upgrade to Go 1.7 kicks in
 func TestClientDeliverAck(t *testing.T) {
 	t.Run("in-between", testClientDeliverAckFunc("specific", uint64(middleOffset), 10, 10, 2*10))
 	t.Run("newest", testClientDeliverAckFunc("newest", 0, 10, 1, 1))
-} */
+}
 
 func testClientDeliverAckFunc(label string, seek, window uint64, threshold, expected int) func(t *testing.T) {
 	return func(t *testing.T) {
@@ -171,7 +167,7 @@ func testClientDeliverAckFunc(label string, seek, window uint64, threshold, expe
 			case msg := <-mds.outgoing:
 				count++
 				if count == threshold {
-					mds.incoming <- testNewAckMessage(msg.GetBlock().Number)
+					mds.incoming <- testNewAckMessage(msg.GetBlock().Header.Number)
 				}
 				if count > expected {
 					t.Fatalf("Delivered %d blocks to the client w/o ACK, expected %d", count, expected)

@@ -21,7 +21,8 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric/core/util"
-	pb "github.com/hyperledger/fabric/protos"
+	pb "github.com/hyperledger/fabric/protos/peer"
+	putils "github.com/hyperledger/fabric/protos/utils"
 )
 
 func createChaincodeSpec(ccType string, path string, args [][]byte) *pb.ChaincodeSpec {
@@ -38,7 +39,7 @@ func createPropsalID() string {
 }
 
 // createChaincodeDeploymentSpec  Returns a deployment proposal of chaincode type
-func createProposalForChaincode(ccChaincodeDeploymentSpec *pb.ChaincodeDeploymentSpec) (proposal *pb.Proposal, err error) {
+func createProposalForChaincode(ccChaincodeDeploymentSpec *pb.ChaincodeDeploymentSpec, creator []byte) (proposal *pb.Proposal, err error) {
 	var ccDeploymentSpecBytes []byte
 	if ccDeploymentSpecBytes, err = proto.Marshal(ccChaincodeDeploymentSpec); err != nil {
 		return nil, fmt.Errorf("Error creating proposal from ChaincodeDeploymentSpec:  %s", err)
@@ -47,11 +48,9 @@ func createProposalForChaincode(ccChaincodeDeploymentSpec *pb.ChaincodeDeploymen
 		ChaincodeID: &pb.ChaincodeID{Name: "lccc"},
 		CtorMsg:     &pb.ChaincodeInput{Args: [][]byte{[]byte("deploy"), []byte("default"), ccDeploymentSpecBytes}}}
 	lcChaincodeInvocationSpec := &pb.ChaincodeInvocationSpec{ChaincodeSpec: lcChaincodeSpec}
-	var ccLifecycleChaincodeInvocationSpecBytes []byte
-	if ccLifecycleChaincodeInvocationSpecBytes, err = proto.Marshal(lcChaincodeInvocationSpec); err != nil {
-		return nil, fmt.Errorf("Error creating proposal from ChaincodeDeploymentSpec:  %s", err)
-	}
+
+	uuid := createPropsalID()
+
 	// make proposal
-	proposal = &pb.Proposal{Type: pb.Proposal_CHAINCODE, Id: createPropsalID(), Payload: ccLifecycleChaincodeInvocationSpecBytes}
-	return proposal, nil
+	return putils.CreateChaincodeProposal(uuid, util.GetTestChainID(), lcChaincodeInvocationSpec, creator)
 }

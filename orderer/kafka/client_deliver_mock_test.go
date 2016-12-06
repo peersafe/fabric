@@ -19,8 +19,8 @@ package kafka
 import (
 	"testing"
 
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
-	"github.com/hyperledger/fabric/orderer/config"
+	"github.com/hyperledger/fabric/orderer/localconfig"
+	ab "github.com/hyperledger/fabric/protos/orderer"
 )
 
 type mockClientDelivererImpl struct {

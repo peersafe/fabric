@@ -19,17 +19,30 @@ package ramledger
 import (
 	"testing"
 
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
+	"github.com/hyperledger/fabric/orderer/common/bootstrap/static"
+	cb "github.com/hyperledger/fabric/protos/common"
 )
+
+var genesisBlock *cb.Block
+
+func init() {
+	bootstrapper := static.New()
+	var err error
+	genesisBlock, err = bootstrapper.GenesisBlock()
+	if err != nil {
+		panic("Error intializing static bootstrap genesis block")
+	}
+}
 
 // TestAppend ensures that appending blocks stores only the maxSize most recent blocks
 // Note that 'only' is applicable because the genesis block will be discarded
 func TestAppend(t *testing.T) {
 	maxSize := 3
-	rl := New(maxSize).(*ramLedger)
-	var blocks []*ab.Block
+	_, rlt := New(maxSize, genesisBlock)
+	rl := rlt.(*ramLedger)
+	var blocks []*cb.Block
 	for i := 0; i < 3; i++ {
-		blocks = append(blocks, &ab.Block{Number: uint64(i + 1)})
+		blocks = append(blocks, &cb.Block{Header: &cb.BlockHeader{Number: uint64(i + 1)}})
 		rl.appendBlock(blocks[i])
 	}
 	item := rl.oldest
@@ -37,8 +50,8 @@ func TestAppend(t *testing.T) {
 		if item.block == nil {
 			t.Fatalf("Block for item %d should not be nil", i)
 		}
-		if item.block.Number != blocks[i].Number {
-			t.Errorf("Expected block %d to be %d but got %d", i, blocks[i].Number, item.block.Number)
+		if item.block.Header.Number != blocks[i].Header.Number {
+			t.Errorf("Expected block %d to be %d but got %d", i, blocks[i].Header.Number, item.block.Header.Number)
 		}
 		if i != 2 && item.next == nil {
 			t.Fatalf("Next item should not be nil")
@@ -51,14 +64,15 @@ func TestAppend(t *testing.T) {
 // TestSignal checks if the signal channel closes when an item is appended
 func TestSignal(t *testing.T) {
 	maxSize := 3
-	rl := New(maxSize).(*ramLedger)
+	_, rlt := New(maxSize, genesisBlock)
+	rl := rlt.(*ramLedger)
 	item := rl.newest
 	select {
 	case <-item.signal:
 		t.Fatalf("There is no successor, there should be no signal to continue")
 	default:
 	}
-	rl.appendBlock(&ab.Block{Number: 1})
+	rl.appendBlock(&cb.Block{Header: &cb.BlockHeader{Number: 1}})
 	select {
 	case <-item.signal:
 	default:
@@ -72,10 +86,11 @@ func TestSignal(t *testing.T) {
 func TestTruncationSafety(t *testing.T) {
 	maxSize := 3
 	newBlocks := 10
-	rl := New(maxSize).(*ramLedger)
-	item := rl.oldest
+	_, rlt := New(maxSize, genesisBlock)
+	rl := rlt.(*ramLedger)
+	item := rl.oldest.next
 	for i := 0; i < newBlocks; i++ {
-		rl.appendBlock(&ab.Block{Number: uint64(i + 1)})
+		rl.appendBlock(&cb.Block{Header: &cb.BlockHeader{Number: uint64(i + 1)}})
 	}
 	count := 0
 	for item.next != nil {

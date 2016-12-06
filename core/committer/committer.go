@@ -16,6 +16,8 @@ limitations under the License.
 
 package committer
 
+import "github.com/hyperledger/fabric/protos/common"
+
 // Committer is the interface supported by committers
 // The only committer is noopssinglechain committer.
 // The interface is intentionally sparse with the sole
@@ -24,6 +26,16 @@ package committer
 // more support (such as Gossip) this interface will
 // change
 type Committer interface {
-	//Start registers and opens communications
-	Start() error
+
+	// Commit block to the ledger
+	CommitBlock(block *common.Block) error
+
+	// Get recent block sequence number
+	LedgerHeight() (uint64, error)
+
+	// Gets blocks with sequence numbers provided in the slice
+	GetBlocks(blockSeqs []uint64) []*common.Block
+
+	// Closes committing service
+	Close()
 }

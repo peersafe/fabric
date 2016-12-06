@@ -22,26 +22,44 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 
-	"github.com/Shopify/sarama"
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
-	"github.com/hyperledger/fabric/orderer/config"
+	"github.com/hyperledger/fabric/orderer/common/bootstrap"
+	"github.com/hyperledger/fabric/orderer/common/bootstrap/static"
 	"github.com/hyperledger/fabric/orderer/kafka"
+	"github.com/hyperledger/fabric/orderer/localconfig"
+	"github.com/hyperledger/fabric/orderer/multichain"
 	"github.com/hyperledger/fabric/orderer/rawledger"
 	"github.com/hyperledger/fabric/orderer/rawledger/fileledger"
 	"github.com/hyperledger/fabric/orderer/rawledger/ramledger"
 	"github.com/hyperledger/fabric/orderer/solo"
+	ab "github.com/hyperledger/fabric/protos/orderer"
+
+	"github.com/Shopify/sarama"
+	"github.com/op/go-logging"
 	"google.golang.org/grpc"
 )
+
+var logger = logging.MustGetLogger("orderer/main")
 
 func main() {
 	conf := config.Load()
 
+	// Start the profiling service if enabled. The ListenAndServe()
+	// call does not return unless an error occurs.
+	if conf.General.Profile.Enabled {
+		go func() {
+			logger.Infof("Starting Go pprof profiling service on %s", conf.General.Profile.Address)
+			panic(fmt.Errorf("Go pprof service failed: %s", http.ListenAndServe(conf.General.Profile.Address, nil)))
+		}()
+	}
+
 	switch conf.General.OrdererType {
 	case "solo":
-		launchSolo(conf)
+		launchGeneric(conf)
 	case "kafka":
 		launchKafka(conf)
 	default:
@@ -49,7 +67,11 @@ func main() {
 	}
 }
 
-func launchSolo(conf *config.TopLevel) {
+func init() {
+	logging.SetLevel(logging.DEBUG, "")
+}
+
+func launchGeneric(conf *config.TopLevel) {
 	grpcServer := grpc.NewServer()
 
 	lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", conf.General.ListenAddress, conf.General.ListenPort))
@@ -58,9 +80,25 @@ func launchSolo(conf *config.TopLevel) {
 		return
 	}
 
+	var bootstrapper bootstrap.Helper
+
+	// Select the bootstrapping mechanism
+	switch conf.General.GenesisMethod {
+	case "static":
+		bootstrapper = static.New()
+	default:
+		panic(fmt.Errorf("Unknown genesis method %s", conf.General.GenesisMethod))
+	}
+
+	genesisBlock, err := bootstrapper.GenesisBlock()
+
+	if err != nil {
+		panic(fmt.Errorf("Error retrieving the genesis block %s", err))
+	}
+
 	// Stand in until real config
 	ledgerType := os.Getenv("ORDERER_LEDGER_TYPE")
-	var rawledger rawledger.ReadWriter
+	var lf rawledger.Factory
 	switch ledgerType {
 	case "file":
 		location := conf.FileLedger.Location
@@ -72,14 +110,25 @@ func launchSolo(conf *config.TopLevel) {
 			}
 		}
 
-		rawledger = fileledger.New(location)
+		lf, _ = fileledger.New(location, genesisBlock)
 	case "ram":
 		fallthrough
 	default:
-		rawledger = ramledger.New(int(conf.RAMLedger.HistorySize))
+		lf, _ = ramledger.New(int(conf.RAMLedger.HistorySize), genesisBlock)
 	}
 
-	solo.New(int(conf.General.QueueSize), int(conf.General.BatchSize), int(conf.General.MaxWindowSize), conf.General.BatchTimeout, rawledger, grpcServer)
+	consenters := make(map[string]multichain.Consenter)
+	consenters["solo"] = solo.New(conf.General.BatchTimeout)
+
+	manager := multichain.NewManagerImpl(lf, consenters)
+
+	server := NewServer(
+		manager,
+		int(conf.General.QueueSize),
+		int(conf.General.MaxWindowSize),
+	)
+
+	ab.RegisterAtomicBroadcastServer(grpcServer, server)
 	grpcServer.Serve(lis)
 }
 
@@ -119,7 +168,7 @@ func launchKafka(conf *config.TopLevel) {
 	signal.Notify(signalChan, os.Interrupt)
 
 	for range signalChan {
-		fmt.Println("Server shutting down")
+		logger.Info("Server shutting down")
 		return
 	}
 }

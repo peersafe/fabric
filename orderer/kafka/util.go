@@ -17,13 +17,8 @@ limitations under the License.
 package kafka
 
 import (
-	"fmt"
-
 	"github.com/Shopify/sarama"
-	"github.com/golang/protobuf/proto"
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
-	"github.com/hyperledger/fabric/orderer/config"
-	"golang.org/x/crypto/sha3"
+	"github.com/hyperledger/fabric/orderer/localconfig"
 )
 
 const (
@@ -32,20 +27,13 @@ const (
 	windowOutOfRangeError = "Window out of range"
 )
 
-func hashBlock(block *ab.Block) (hash, data []byte) {
-	data, err := proto.Marshal(block)
-	if err != nil {
-		panic(fmt.Errorf("Failed to marshal block: %v", err))
-	}
-
-	hash = make([]byte, 64)
-	sha3.ShakeSum256(hash, data)
-	return
-}
-
 func newBrokerConfig(conf *config.TopLevel) *sarama.Config {
 	brokerConfig := sarama.NewConfig()
 	brokerConfig.Version = conf.Kafka.Version
+	brokerConfig.Producer.Partitioner = newStaticPartitioner(conf.Kafka.PartitionID)
+	// set equivalent of kafka producer config max.request.bytes to the deafult
+	// value of a kafka server's socket.request.max.bytes property (100MiB).
+	brokerConfig.Producer.MaxMessageBytes = int(sarama.MaxRequestSize)
 	return brokerConfig
 }
 
@@ -65,4 +53,24 @@ func newOffsetReq(conf *config.TopLevel, seek int64) *sarama.OffsetRequest {
 	// https://mail-archives.apache.org/mod_mbox/kafka-users/201411.mbox/%3Cc159383825e04129b77253ffd6c448aa@BY2PR02MB505.namprd02.prod.outlook.com%3E
 	req.AddBlock(conf.Kafka.Topic, conf.Kafka.PartitionID, seek, 1)
 	return req
+}
+
+// newStaticPartitioner returns a PartitionerConstructor that returns a Partitioner
+// that always chooses the specified partition.
+func newStaticPartitioner(partition int32) sarama.PartitionerConstructor {
+	return func(topic string) sarama.Partitioner {
+		return &staticPartitioner{partition}
+	}
+}
+
+type staticPartitioner struct {
+	partitionID int32
+}
+
+func (p *staticPartitioner) Partition(message *sarama.ProducerMessage, numPartitions int32) (int32, error) {
+	return p.partitionID, nil
+}
+
+func (p *staticPartitioner) RequiresConsistency() bool {
+	return true
 }

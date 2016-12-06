@@ -22,8 +22,21 @@ import (
 	"os"
 	"testing"
 
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
+	"github.com/hyperledger/fabric/orderer/common/bootstrap/static"
+	cb "github.com/hyperledger/fabric/protos/common"
+	ab "github.com/hyperledger/fabric/protos/orderer"
 )
+
+var genesisBlock *cb.Block
+
+func init() {
+	bootstrapper := static.New()
+	var err error
+	genesisBlock, err = bootstrapper.GenesisBlock()
+	if err != nil {
+		panic("Error intializing static bootstrap genesis block")
+	}
+}
 
 type testEnv struct {
 	t        *testing.T
@@ -31,11 +44,12 @@ type testEnv struct {
 }
 
 func initialize(t *testing.T) (*testEnv, *fileLedger) {
-	name, err := ioutil.TempDir("", "hyperledger")
+	name, err := ioutil.TempDir("", "hyperledger_fabric")
 	if err != nil {
 		t.Fatalf("Error creating temp dir: %s", err)
 	}
-	return &testEnv{location: name, t: t}, New(name).(*fileLedger)
+	_, fl := New(name, genesisBlock)
+	return &testEnv{location: name, t: t}, fl.(*fileLedger)
 }
 
 func (tev *testEnv) tearDown() {
@@ -55,7 +69,7 @@ func TestInitialization(t *testing.T) {
 	if block == nil || !found {
 		t.Fatalf("Error retrieving genesis block")
 	}
-	if !bytes.Equal(block.Hash(), fl.lastHash) {
+	if !bytes.Equal(block.Header.Hash(), fl.lastHash) {
 		t.Fatalf("Block hashes did no match")
 	}
 }
@@ -63,8 +77,9 @@ func TestInitialization(t *testing.T) {
 func TestReinitialization(t *testing.T) {
 	tev, ofl := initialize(t)
 	defer tev.tearDown()
-	ofl.Append([]*ab.BroadcastMessage{&ab.BroadcastMessage{Data: []byte("My Data")}}, nil)
-	fl := New(tev.location).(*fileLedger)
+	ofl.Append([]*cb.Envelope{&cb.Envelope{Payload: []byte("My Data")}}, nil)
+	_, flt := New(tev.location, genesisBlock)
+	fl := flt.(*fileLedger)
 	if fl.height != 2 {
 		t.Fatalf("Block height should be 2")
 	}
@@ -72,7 +87,7 @@ func TestReinitialization(t *testing.T) {
 	if block == nil || !found {
 		t.Fatalf("Error retrieving block 1")
 	}
-	if !bytes.Equal(block.Hash(), fl.lastHash) {
+	if !bytes.Equal(block.Header.Hash(), fl.lastHash) {
 		t.Fatalf("Block hashes did no match")
 	}
 }
@@ -81,7 +96,7 @@ func TestAddition(t *testing.T) {
 	tev, fl := initialize(t)
 	defer tev.tearDown()
 	prevHash := fl.lastHash
-	fl.Append([]*ab.BroadcastMessage{&ab.BroadcastMessage{Data: []byte("My Data")}}, nil)
+	fl.Append([]*cb.Envelope{&cb.Envelope{Payload: []byte("My Data")}}, nil)
 	if fl.height != 2 {
 		t.Fatalf("Block height should be 2")
 	}
@@ -89,7 +104,7 @@ func TestAddition(t *testing.T) {
 	if block == nil || !found {
 		t.Fatalf("Error retrieving genesis block")
 	}
-	if !bytes.Equal(block.PrevHash, prevHash) {
+	if !bytes.Equal(block.Header.PreviousHash, prevHash) {
 		t.Fatalf("Block hashes did no match")
 	}
 }
@@ -97,7 +112,7 @@ func TestAddition(t *testing.T) {
 func TestRetrieval(t *testing.T) {
 	tev, fl := initialize(t)
 	defer tev.tearDown()
-	fl.Append([]*ab.BroadcastMessage{&ab.BroadcastMessage{Data: []byte("My Data")}}, nil)
+	fl.Append([]*cb.Envelope{&cb.Envelope{Payload: []byte("My Data")}}, nil)
 	it, num := fl.Iterator(ab.SeekInfo_OLDEST, 99)
 	if num != 0 {
 		t.Fatalf("Expected genesis block iterator, but got %d", num)
@@ -109,10 +124,10 @@ func TestRetrieval(t *testing.T) {
 		t.Fatalf("Should be ready for block read")
 	}
 	block, status := it.Next()
-	if status != ab.Status_SUCCESS {
+	if status != cb.Status_SUCCESS {
 		t.Fatalf("Expected to successfully read the genesis block")
 	}
-	if block.Number != 0 {
+	if block.Header.Number != 0 {
 		t.Fatalf("Expected to successfully retrieve the genesis block")
 	}
 	signal = it.ReadyChan()
@@ -122,11 +137,11 @@ func TestRetrieval(t *testing.T) {
 		t.Fatalf("Should still be ready for block read")
 	}
 	block, status = it.Next()
-	if status != ab.Status_SUCCESS {
+	if status != cb.Status_SUCCESS {
 		t.Fatalf("Expected to successfully read the second block")
 	}
-	if block.Number != 1 {
-		t.Fatalf("Expected to successfully retrieve the second block but got block number %d", block.Number)
+	if block.Header.Number != 1 {
+		t.Fatalf("Expected to successfully retrieve the second block but got block number %d", block.Header.Number)
 	}
 }
 
@@ -143,17 +158,17 @@ func TestBlockedRetrieval(t *testing.T) {
 		t.Fatalf("Should not be ready for block read")
 	default:
 	}
-	fl.Append([]*ab.BroadcastMessage{&ab.BroadcastMessage{Data: []byte("My Data")}}, nil)
+	fl.Append([]*cb.Envelope{&cb.Envelope{Payload: []byte("My Data")}}, nil)
 	select {
 	case <-signal:
 	default:
 		t.Fatalf("Should now be ready for block read")
 	}
 	block, status := it.Next()
-	if status != ab.Status_SUCCESS {
+	if status != cb.Status_SUCCESS {
 		t.Fatalf("Expected to successfully read the second block")
 	}
-	if block.Number != 1 {
+	if block.Header.Number != 1 {
 		t.Fatalf("Expected to successfully retrieve the second block")
 	}
 }

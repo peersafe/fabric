@@ -18,27 +18,33 @@ package discovery
 
 import (
 	"fmt"
+	"io"
+	"net"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/hyperledger/fabric/gossip/common"
 	"github.com/hyperledger/fabric/gossip/proto"
+	"github.com/op/go-logging"
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	"io"
-	"net"
-	"runtime"
-	"sync"
-	"testing"
-	"time"
 )
+
+var timeout = time.Second * time.Duration(15)
 
 type dummyCommModule struct {
 	id           string
-	presumeDead  chan string
+	presumeDead  chan common.PKIidType
 	detectedDead chan string
 	streams      map[string]proto.Gossip_GossipStreamClient
 	conns        map[string]*grpc.ClientConn
 	lock         *sync.RWMutex
-	incMsgs      chan GossipMsg
+	incMsgs      chan *proto.GossipMessage
 	lastSeqs     map[string]uint64
+	shouldGossip bool
 }
 
 type gossipMsg struct {
@@ -51,9 +57,10 @@ func (m *gossipMsg) GetGossipMessage() *proto.GossipMessage {
 
 type gossipInstance struct {
 	comm *dummyCommModule
-	DiscoveryService
-	gRGCserv *grpc.Server
-	lsnr     net.Listener
+	Discovery
+	gRGCserv     *grpc.Server
+	lsnr         net.Listener
+	shouldGossip bool
 }
 
 func (comm *dummyCommModule) ValidateAliveMsg(am *proto.AliveMessage) bool {
@@ -65,6 +72,11 @@ func (comm *dummyCommModule) SignMessage(am *proto.AliveMessage) *proto.AliveMes
 }
 
 func (comm *dummyCommModule) Gossip(msg *proto.GossipMessage) {
+	if !comm.shouldGossip {
+		return
+	}
+	comm.lock.Lock()
+	defer comm.lock.Unlock()
 	for _, conn := range comm.streams {
 		conn.Send(msg)
 	}
@@ -72,7 +84,7 @@ func (comm *dummyCommModule) Gossip(msg *proto.GossipMessage) {
 
 func (comm *dummyCommModule) SendToPeer(peer *NetworkMember, msg *proto.GossipMessage) {
 	comm.lock.RLock()
-	_, exists := comm.streams[peer.Id]
+	_, exists := comm.streams[peer.Endpoint]
 	comm.lock.RUnlock()
 
 	if !exists {
@@ -82,7 +94,7 @@ func (comm *dummyCommModule) SendToPeer(peer *NetworkMember, msg *proto.GossipMe
 		}
 	}
 	comm.lock.Lock()
-	comm.streams[peer.Id].Send(msg)
+	comm.streams[peer.Endpoint].Send(msg)
 	comm.lock.Unlock()
 }
 
@@ -90,56 +102,49 @@ func (comm *dummyCommModule) Ping(peer *NetworkMember) bool {
 	comm.lock.Lock()
 	defer comm.lock.Unlock()
 
-	_, alreadyExists := comm.streams[peer.Id]
+	_, alreadyExists := comm.streams[peer.Endpoint]
 	if !alreadyExists {
-		newConn, err := grpc.Dial(peer.Endpoint, grpc.WithInsecure(), grpc.WithTimeout(time.Duration(500)*time.Millisecond))
+		newConn, err := grpc.Dial(peer.Endpoint, grpc.WithInsecure())
 		if err != nil {
-			//fmt.Printf("Error dialing: to %v: %v\n",peer.Endpoint, err)
 			return false
 		}
 		if stream, err := proto.NewGossipClient(newConn).GossipStream(context.Background()); err == nil {
-			comm.conns[peer.Id] = newConn
-			comm.streams[peer.Id] = stream
+			comm.conns[peer.Endpoint] = newConn
+			comm.streams[peer.Endpoint] = stream
 			return true
-		} else {
-			//fmt.Printf("Error creating stream to %v: %v\n",peer.Endpoint,  err)
-			return false
 		}
+		return false
 	}
-	conn := comm.conns[peer.Id]
+	conn := comm.conns[peer.Endpoint]
 	if _, err := proto.NewGossipClient(conn).Ping(context.Background(), &proto.Empty{}); err != nil {
-		//fmt.Printf("Error pinging %v: %v\n",peer.Endpoint, err)
 		return false
 	}
 	return true
 }
 
-func (comm *dummyCommModule) Accept() <-chan GossipMsg {
+func (comm *dummyCommModule) Accept() <-chan *proto.GossipMessage {
 	return comm.incMsgs
 }
 
-func (comm *dummyCommModule) PresumedDead() <-chan string {
+func (comm *dummyCommModule) PresumedDead() <-chan common.PKIidType {
 	return comm.presumeDead
 }
 
-func (comm *dummyCommModule) CloseConn(id string) {
+func (comm *dummyCommModule) CloseConn(peer *NetworkMember) {
 	comm.lock.Lock()
 	defer comm.lock.Unlock()
 
-	if _, exists := comm.streams[id]; !exists {
+	if _, exists := comm.streams[peer.Endpoint]; !exists {
 		return
 	}
 
-	comm.streams[id].CloseSend()
-	comm.conns[id].Close()
-
-	delete(comm.streams, id)
-	delete(comm.conns, id)
+	comm.streams[peer.Endpoint].CloseSend()
+	comm.conns[peer.Endpoint].Close()
 }
 
 func init() {
-	aliveTimeInterval = time.Duration(time.Millisecond * 10)
-	aliveExpirationTimeout = 100 * aliveTimeInterval
+	aliveTimeInterval = time.Duration(time.Millisecond * 100)
+	aliveExpirationTimeout = 10 * aliveTimeInterval
 	aliveExpirationCheckInterval = aliveTimeInterval
 	reconnectInterval = aliveExpirationTimeout
 }
@@ -153,7 +158,9 @@ func (g *gossipInstance) GossipStream(stream proto.Gossip_GossipStreamServer) er
 		if err != nil {
 			return err
 		}
-		g.comm.incMsgs <- &gossipMsg{gMsg}
+		lgr := g.Discovery.(*gossipDiscoveryImpl).logger
+		lgr.Debug(g.Discovery.Self().Endpoint, "Got message:", gMsg)
+		g.comm.incMsgs <- gMsg
 
 		if aliveMsg := gMsg.GetAliveMsg(); aliveMsg != nil {
 			g.tryForwardMessage(gMsg)
@@ -167,7 +174,7 @@ func (g *gossipInstance) tryForwardMessage(msg *proto.GossipMessage) {
 	aliveMsg := msg.GetAliveMsg()
 
 	forward := false
-	id := aliveMsg.Membership.Id
+	id := string(aliveMsg.Membership.PkiID)
 	seqNum := aliveMsg.Timestamp.SeqNum
 	if last, exists := g.comm.lastSeqs[id]; exists {
 		if last < seqNum {
@@ -189,29 +196,45 @@ func (g *gossipInstance) tryForwardMessage(msg *proto.GossipMessage) {
 func (g *gossipInstance) Stop() {
 	g.gRGCserv.Stop()
 	g.lsnr.Close()
-	g.DiscoveryService.Stop()
+	for _, stream := range g.comm.streams {
+		stream.CloseSend()
+	}
+	for _, conn := range g.comm.conns {
+		conn.Close()
+	}
+	g.Discovery.Stop()
 }
 
 func (g *gossipInstance) Ping(context.Context, *proto.Empty) (*proto.Empty, error) {
 	return &proto.Empty{}, nil
 }
 
-func createDiscoveryInstance(port int, id string, bootstrapPeers []*NetworkMember) *gossipInstance {
+func createDiscoveryInstance(port int, id string, bootstrapPeers []string) *gossipInstance {
+	return createDiscoveryInstanceThatGossips(port, id, bootstrapPeers, true)
+}
+
+func createDiscoveryInstanceWithNoGossip(port int, id string, bootstrapPeers []string) *gossipInstance {
+	return createDiscoveryInstanceThatGossips(port, id, bootstrapPeers, false)
+}
+
+func createDiscoveryInstanceThatGossips(port int, id string, bootstrapPeers []string, shouldGossip bool) *gossipInstance {
 	comm := &dummyCommModule{
 		conns:        make(map[string]*grpc.ClientConn),
 		streams:      make(map[string]proto.Gossip_GossipStreamClient),
-		incMsgs:      make(chan GossipMsg, 1000),
-		presumeDead:  make(chan string, 10000),
+		incMsgs:      make(chan *proto.GossipMessage, 1000),
+		presumeDead:  make(chan common.PKIidType, 10000),
 		id:           id,
 		detectedDead: make(chan string, 10000),
 		lock:         &sync.RWMutex{},
 		lastSeqs:     make(map[string]uint64),
+		shouldGossip: shouldGossip,
 	}
 
+	endpoint := fmt.Sprintf("localhost:%d", port)
 	self := NetworkMember{
 		Metadata: []byte{},
-		Id:       id,
-		Endpoint: fmt.Sprintf("localhost:%d", port),
+		PKIid:    []byte(endpoint),
+		Endpoint: endpoint,
 	}
 
 	listenAddress := fmt.Sprintf("%s:%d", "", port)
@@ -222,7 +245,8 @@ func createDiscoveryInstance(port int, id string, bootstrapPeers []*NetworkMembe
 	s := grpc.NewServer()
 
 	discSvc := NewDiscoveryService(bootstrapPeers, self, comm, comm)
-	gossInst := &gossipInstance{comm: comm, gRGCserv: s, DiscoveryService: discSvc, lsnr: ll}
+	discSvc.(*gossipDiscoveryImpl).logger.SetLevel(logging.WARNING)
+	gossInst := &gossipInstance{comm: comm, gRGCserv: s, Discovery: discSvc, lsnr: ll, shouldGossip: shouldGossip}
 
 	proto.RegisterGossipServer(s, gossInst)
 	go s.Serve(ll)
@@ -230,14 +254,15 @@ func createDiscoveryInstance(port int, id string, bootstrapPeers []*NetworkMembe
 	return gossInst
 }
 
-func bootPeer(port int) *NetworkMember {
-	return &NetworkMember{Id: fmt.Sprintf("d%d", port), Endpoint: fmt.Sprintf("localhost:%d", port)}
+func bootPeer(port int) string {
+	return fmt.Sprintf("localhost:%d", port)
 }
 
 func TestUpdate(t *testing.T) {
+	t.Parallel()
 	nodeNum := 5
-	bootPeers := []*NetworkMember{bootPeer(6611), bootPeer(6612)}
-	instances := make([]*gossipInstance, 0)
+	bootPeers := []string{bootPeer(6611), bootPeer(6612)}
+	instances := []*gossipInstance{}
 
 	inst := createDiscoveryInstance(6611, "d1", bootPeers)
 	instances = append(instances, inst)
@@ -251,40 +276,70 @@ func TestUpdate(t *testing.T) {
 		instances = append(instances, inst)
 	}
 
-	time.Sleep(time.Duration(2) * time.Second)
-	assert.Equal(t, nodeNum-1, len(instances[nodeNum-1].GetMembership()))
+	fullMembership := func() bool {
+		return nodeNum-1 == len(instances[nodeNum-1].GetMembership())
+	}
+
+	waitUntilOrFail(t, fullMembership)
 
 	instances[0].UpdateMetadata([]byte("bla bla"))
 	instances[nodeNum-1].UpdateEndpoint("localhost:5511")
-	time.Sleep(time.Duration(2) * time.Second)
 
-	for _, member := range instances[nodeNum-1].GetMembership() {
-		if member.Id == instances[0].comm.id {
-			assert.Equal(t, "bla bla", string(member.Metadata))
+	checkMembership := func() bool {
+		for _, member := range instances[nodeNum-1].GetMembership() {
+			if string(member.PKIid) == instances[0].comm.id {
+				if "bla bla" != string(member.Metadata) {
+					return false
+				}
+			}
 		}
-	}
 
-	for _, member := range instances[0].GetMembership() {
-		if member.Id == instances[nodeNum-1].comm.id {
-			assert.Equal(t, "localhost:5511", string(member.Endpoint))
+		for _, member := range instances[0].GetMembership() {
+			if string(member.PKIid) == instances[nodeNum-1].comm.id {
+				if "localhost:5511" != string(member.Endpoint) {
+					return false
+				}
+			}
 		}
+		return true
 	}
 
-	stopAction := &sync.WaitGroup{}
-	for _, inst := range instances {
-		stopAction.Add(1)
-		go func(inst *gossipInstance) {
-			defer stopAction.Done()
-			inst.Stop()
-		}(inst)
+	waitUntilOrFail(t, checkMembership)
+	stopInstances(t, instances)
+}
+
+func TestInitiateSync(t *testing.T) {
+	t.Parallel()
+	nodeNum := 10
+	bootPeers := []string{bootPeer(3611), bootPeer(3612)}
+	instances := []*gossipInstance{}
+
+	toDie := int32(0)
+	for i := 1; i <= nodeNum; i++ {
+		id := fmt.Sprintf("d%d", i)
+		inst := createDiscoveryInstanceWithNoGossip(3610+i, id, bootPeers)
+		instances = append(instances, inst)
+		go func() {
+			for {
+				if atomic.LoadInt32(&toDie) == int32(1) {
+					return
+				}
+				time.Sleep(aliveExpirationTimeout / 3)
+				inst.InitiateSync(9)
+			}
+		}()
 	}
-	stopAction.Wait()
+	time.Sleep(aliveExpirationTimeout * 4)
+	assertMembership(t, instances, nodeNum-1)
+	atomic.StoreInt32(&toDie, int32(1))
+	stopInstances(t, instances)
 }
 
 func TestExpiration(t *testing.T) {
+	t.Parallel()
 	nodeNum := 5
-	bootPeers := []*NetworkMember{bootPeer(2611), bootPeer(2612)}
-	instances := make([]*gossipInstance, 0)
+	bootPeers := []string{bootPeer(2611), bootPeer(2612)}
+	instances := []*gossipInstance{}
 
 	inst := createDiscoveryInstance(2611, "d1", bootPeers)
 	instances = append(instances, inst)
@@ -298,45 +353,119 @@ func TestExpiration(t *testing.T) {
 		instances = append(instances, inst)
 	}
 
-	time.Sleep(time.Duration(2) * time.Second)
-	assert.Equal(t, nodeNum-1, len(instances[nodeNum-1].GetMembership()))
+	assertMembership(t, instances, nodeNum-1)
 
-	instances[nodeNum-1].Stop() // stop instance 4
-	instances[nodeNum-2].Stop() // stop instance 3
+	waitUntilOrFailBlocking(t, instances[nodeNum-1].Stop)
+	waitUntilOrFailBlocking(t, instances[nodeNum-2].Stop)
 
-	time.Sleep(time.Duration(5) * time.Second)
-	assert.Equal(t, nodeNum-3, len(instances[0].GetMembership()))
+	assertMembership(t, instances, nodeNum-3)
 
-	go printStackTrace()
-
+	stopAction := &sync.WaitGroup{}
 	for i, inst := range instances {
-		if i == 4 || i == 3 {
-			continue
+		if i+2 == nodeNum {
+			break
 		}
-		inst.Stop()
+		stopAction.Add(1)
+		go func(inst *gossipInstance) {
+			defer stopAction.Done()
+			inst.Stop()
+		}(inst)
 	}
+
+	waitUntilOrFailBlocking(t, stopAction.Wait)
 }
 
 func TestGetFullMembership(t *testing.T) {
-	nodeNum := 10
-	bootPeers := []*NetworkMember{bootPeer(5611), bootPeer(5612)}
-	instances := make([]*gossipInstance, 0)
+	t.Parallel()
+	nodeNum := 15
+	bootPeers := []string{bootPeer(5511), bootPeer(5512)}
+	instances := []*gossipInstance{}
 
-	inst := createDiscoveryInstance(5611, "d1", bootPeers)
+	inst := createDiscoveryInstance(5511, "d1", bootPeers)
 	instances = append(instances, inst)
 
-	inst = createDiscoveryInstance(5612, "d2", bootPeers)
+	inst = createDiscoveryInstance(5512, "d2", bootPeers)
 	instances = append(instances, inst)
 
 	for i := 3; i <= nodeNum; i++ {
 		id := fmt.Sprintf("d%d", i)
-		inst = createDiscoveryInstance(5610+i, id, bootPeers)
+		inst = createDiscoveryInstance(5510+i, id, bootPeers)
 		instances = append(instances, inst)
 	}
 
-	time.Sleep(time.Duration(2) * time.Second)
-	assert.Equal(t, nodeNum-1, len(instances[nodeNum-1].GetMembership()))
+	assertMembership(t, instances, nodeNum-1)
+	stopInstances(t, instances)
+}
 
+func TestGossipDiscoveryStopping(t *testing.T) {
+	t.Parallel()
+	inst := createDiscoveryInstance(9611, "d1", []string{bootPeer(9611)})
+	time.Sleep(time.Second)
+	waitUntilOrFailBlocking(t, inst.Stop)
+
+}
+
+func TestConvergence(t *testing.T) {
+	t.Parallel()
+	// scenario:
+	// {boot peer: [peer list]}
+	// {d1: d2, d3, d4}
+	// {d5: d6, d7, d8}
+	// {d9: d10, d11, d12}
+	// connect all boot peers with d13
+	// take down d13
+	// ensure still full membership
+	instances := []*gossipInstance{}
+	for _, i := range []int{1, 5, 9} {
+		bootPort := 4610 + i
+		id := fmt.Sprintf("d%d", i)
+		leader := createDiscoveryInstance(bootPort, id, []string{})
+		instances = append(instances, leader)
+		for minionIndex := 1; minionIndex <= 3; minionIndex++ {
+			id := fmt.Sprintf("d%d", i+minionIndex)
+			minion := createDiscoveryInstance(4610+minionIndex+i, id, []string{bootPeer(bootPort)})
+			instances = append(instances, minion)
+		}
+	}
+
+	assertMembership(t, instances, 3)
+	connector := createDiscoveryInstance(4623, fmt.Sprintf("d13"), []string{bootPeer(4611), bootPeer(4615), bootPeer(4619)})
+	instances = append(instances, connector)
+	assertMembership(t, instances, 12)
+	connector.Stop()
+	instances = instances[:len(instances)-1]
+	assertMembership(t, instances, 11)
+	stopInstances(t, instances)
+}
+
+func waitUntilOrFail(t *testing.T, pred func() bool) {
+	start := time.Now()
+	limit := start.UnixNano() + timeout.Nanoseconds()
+	for time.Now().UnixNano() < limit {
+		if pred() {
+			return
+		}
+		time.Sleep(timeout / 10)
+	}
+	assert.Fail(t, "Timeout expired!")
+}
+
+func waitUntilOrFailBlocking(t *testing.T, f func()) {
+	successChan := make(chan struct{}, 1)
+	go func() {
+		f()
+		successChan <- struct{}{}
+	}()
+	select {
+	case <-time.NewTimer(timeout).C:
+		break
+	case <-successChan:
+		return
+	}
+	assert.Fail(t, "Timeout expired!")
+}
+
+func stopInstances(t *testing.T, instances []*gossipInstance) {
 	stopAction := &sync.WaitGroup{}
 	for _, inst := range instances {
 		stopAction.Add(1)
@@ -345,33 +474,18 @@ func TestGetFullMembership(t *testing.T) {
 			inst.Stop()
 		}(inst)
 	}
-	stopAction.Wait()
+
+	waitUntilOrFailBlocking(t, stopAction.Wait)
 }
 
-func TestGossipDiscoveryStopping(t *testing.T) {
-	inst := createDiscoveryInstance(9611, "d1", []*NetworkMember{bootPeer(9611)})
-
-	diedChan := make(chan struct{})
-	go func(inst *gossipInstance) {
-		inst.Stop()
-		diedChan <- struct{}{}
-	}(inst)
-
-	timer := time.Tick(time.Duration(2000) * time.Millisecond)
-
-	select {
-	case <-timer:
-		t.Fatal("Didn't stop within a timely manner")
-		t.Fail()
-	case <-diedChan:
+func assertMembership(t *testing.T, instances []*gossipInstance, expectedNum int) {
+	fullMembership := func() bool {
+		for _, inst := range instances {
+			if len(inst.GetMembership()) == expectedNum {
+				return true
+			}
+		}
+		return false
 	}
-}
-
-func printStackTrace() {
-	func() {
-		time.Sleep(time.Duration(10) * time.Second)
-		buf := make([]byte, 1<<16)
-		runtime.Stack(buf, true)
-		fmt.Printf("%s", buf)
-	}()
+	waitUntilOrFail(t, fullMembership)
 }

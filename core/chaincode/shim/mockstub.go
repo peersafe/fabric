@@ -32,7 +32,7 @@ import (
 var mockLogger = logging.MustGetLogger("mock")
 
 // MockStub is an implementation of ChaincodeStubInterface for unit testing chaincode.
-// Use this instead of ChaincodeStub in your chaincode's unit test calls to Init, Query or Invoke.
+// Use this instead of ChaincodeStub in your chaincode's unit test calls to Init or Invoke.
 type MockStub struct {
 	// arguments the stub was called with
 	args [][]byte
@@ -120,14 +120,6 @@ func (stub *MockStub) MockInvoke(uuid string, args [][]byte) ([]byte, error) {
 	stub.MockTransactionStart(uuid)
 	bytes, err := stub.cc.Invoke(stub)
 	stub.MockTransactionEnd(uuid)
-	return bytes, err
-}
-
-// Query this chaincode
-func (stub *MockStub) MockQuery(args [][]byte) ([]byte, error) {
-	stub.args = args
-	// no transaction needed for queries
-	bytes, err := stub.cc.Query(stub)
 	return bytes, err
 }
 
@@ -266,20 +258,6 @@ func (stub *MockStub) InvokeChaincode(chaincodeName string, args [][]byte) ([]by
 	//	function, strings := getFuncArgs(args)
 	bytes, err := otherStub.MockInvoke(stub.TxID, args)
 	mockLogger.Debug("MockStub", stub.Name, "Invoked peer chaincode", otherStub.Name, "got", bytes, err)
-	return bytes, err
-}
-
-func (stub *MockStub) QueryChaincode(chaincodeName string, args [][]byte) ([]byte, error) {
-	// TODO "args" here should possibly be a serialized pb.ChaincodeInput
-	mockLogger.Debug("MockStub", stub.Name, "Looking for peer chaincode", chaincodeName)
-	otherStub := stub.Invokables[chaincodeName]
-	if otherStub == nil {
-		mockLogger.Error("Could not find peer chaincode to query", chaincodeName)
-		return nil, errors.New("Could not find peer chaincode to query")
-	}
-	mockLogger.Debug("MockStub", stub.Name, "Querying peer chaincode", otherStub.Name, args)
-	bytes, err := otherStub.MockQuery(args)
-	mockLogger.Debug("MockStub", stub.Name, "Queried peer chaincode", otherStub.Name, "got", bytes, err)
 	return bytes, err
 }
 

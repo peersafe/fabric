@@ -17,11 +17,12 @@ limitations under the License.
 package producer
 
 import (
-	ehpb "github.com/hyperledger/fabric/protos"
+	"github.com/hyperledger/fabric/protos/common"
+	ehpb "github.com/hyperledger/fabric/protos/peer"
 )
 
 //CreateBlockEvent creates a Event from a Block
-func CreateBlockEvent(te *ehpb.Block) *ehpb.Event {
+func CreateBlockEvent(te *common.Block) *ehpb.Event {
 	return &ehpb.Event{Event: &ehpb.Event_Block{Block: te}}
 }
 

@@ -19,8 +19,8 @@ package kafka
 import (
 	"sync"
 
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
-	"github.com/hyperledger/fabric/orderer/config"
+	"github.com/hyperledger/fabric/orderer/localconfig"
+	ab "github.com/hyperledger/fabric/protos/orderer"
 )
 
 // Deliverer allows the caller to receive blocks from the orderer

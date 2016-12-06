@@ -17,7 +17,7 @@ limitations under the License.
 package rawledger
 
 import (
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
+	cb "github.com/hyperledger/fabric/protos/common"
 )
 
 var closedChan chan struct{}
@@ -27,12 +27,12 @@ func init() {
 	close(closedChan)
 }
 
-// NotFoundErrorIterator simply always returns an error of ab.Status_NOT_FOUND, and is generally useful for implementations of the Reader interface
+// NotFoundErrorIterator simply always returns an error of cb.Status_NOT_FOUND, and is generally useful for implementations of the Reader interface
 type NotFoundErrorIterator struct{}
 
-// Next returns nil, ab.Status_NOT_FOUND
-func (nfei *NotFoundErrorIterator) Next() (*ab.Block, ab.Status) {
-	return nil, ab.Status_NOT_FOUND
+// Next returns nil, cb.Status_NOT_FOUND
+func (nfei *NotFoundErrorIterator) Next() (*cb.Block, cb.Status) {
+	return nil, cb.Status_NOT_FOUND
 }
 
 // ReadyChan returns a closed channel

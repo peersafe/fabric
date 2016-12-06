@@ -17,15 +17,18 @@ limitations under the License.
 package gossip
 
 import (
+	"time"
+
+	"github.com/hyperledger/fabric/gossip/common"
 	"github.com/hyperledger/fabric/gossip/discovery"
 	"github.com/hyperledger/fabric/gossip/proto"
-	"time"
 )
 
-type GossipService interface {
+// Gossip is the interface of the gossip component
+type Gossip interface {
 
-	// GetPeersMetadata returns a mapping of endpoint --> metadata
-	GetPeersMetadata() map[string][]byte
+	// GetPeers returns a mapping of endpoint --> []discovery.NetworkMember
+	GetPeers() []discovery.NetworkMember
 
 	// UpdateMetadata updates the self metadata of the discovery layer
 	UpdateMetadata([]byte)
@@ -34,19 +37,18 @@ type GossipService interface {
 	Gossip(msg *proto.GossipMessage)
 
 	// Accept returns a channel that outputs messages from other peers
-	Accept(MessageAcceptor) <-chan *proto.GossipMessage
+	Accept(common.MessageAcceptor) <-chan *proto.GossipMessage
 
 	// Stop stops the gossip component
 	Stop()
 }
 
-type MessageAcceptor func(*proto.GossipMessage) bool
-
-type GossipConfig struct {
+// Config is the configuration of the gossip component
+type Config struct {
 	BindPort            int
-	Id                  string
+	ID                  string
 	SelfEndpoint        string
-	BootstrapPeers      []*discovery.NetworkMember
+	BootstrapPeers      []string
 	PropagateIterations int
 	PropagatePeerNum    int
 

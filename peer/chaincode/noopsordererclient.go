@@ -24,8 +24,10 @@ package chaincode
 //-------------------------------------------------------------
 import (
 	"fmt"
+	"time"
 
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
+	cb "github.com/hyperledger/fabric/protos/common"
+	ab "github.com/hyperledger/fabric/protos/orderer"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
@@ -39,13 +41,25 @@ func newBroadcastClient(client ab.AtomicBroadcast_BroadcastClient) *broadcastCli
 	return &broadcastClient{client: client}
 }
 
-func (s *broadcastClient) broadcast(transaction []byte) error {
-	return s.client.Send(&ab.BroadcastMessage{Data: transaction})
+func (s *broadcastClient) getAck() error {
+	msg, err := s.client.Recv()
+	if err != nil {
+		return err
+	}
+	if msg.Status != cb.Status_SUCCESS {
+		return fmt.Errorf("Got unexpected status: %v", msg.Status)
+	}
+	return nil
 }
 
 //Send data to solo orderer
-func Send(serverAddr string, data []byte) error {
-	conn, err := grpc.Dial(serverAddr, grpc.WithInsecure())
+func Send(serverAddr string, env *cb.Envelope) error {
+	var opts []grpc.DialOption
+	opts = append(opts, grpc.WithInsecure())
+	opts = append(opts, grpc.WithTimeout(3*time.Second))
+	opts = append(opts, grpc.WithBlock())
+
+	conn, err := grpc.Dial(serverAddr, opts...)
 	defer conn.Close()
 	if err != nil {
 		return fmt.Errorf("Error connecting: %s", err)
@@ -56,7 +70,11 @@ func Send(serverAddr string, data []byte) error {
 	}
 
 	s := newBroadcastClient(client)
-	s.broadcast(data)
+	if err = s.client.Send(env); err != nil {
+		return fmt.Errorf("Could not send :%s)", err)
+	}
 
-	return nil
+	err = s.getAck()
+
+	return err
 }

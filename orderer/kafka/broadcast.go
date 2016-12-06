@@ -21,8 +21,12 @@ import (
 	"sync"
 	"time"
 
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
-	"github.com/hyperledger/fabric/orderer/config"
+	"github.com/hyperledger/fabric/orderer/common/bootstrap/static"
+	"github.com/hyperledger/fabric/orderer/localconfig"
+	cb "github.com/hyperledger/fabric/protos/common"
+	ab "github.com/hyperledger/fabric/protos/orderer"
+
+	"github.com/golang/protobuf/proto"
 )
 
 // Broadcaster allows the caller to submit messages to the orderer
@@ -36,26 +40,23 @@ type broadcasterImpl struct {
 	config   *config.TopLevel
 	once     sync.Once
 
-	batchChan  chan *ab.BroadcastMessage
-	messages   []*ab.BroadcastMessage
+	batchChan  chan *cb.Envelope
+	messages   [][]byte
 	nextNumber uint64
 	prevHash   []byte
 }
 
 func newBroadcaster(conf *config.TopLevel) Broadcaster {
-	return &broadcasterImpl{
+	genesisBlock, _ := static.New().GenesisBlock()
+
+	b := &broadcasterImpl{
 		producer:   newProducer(conf),
 		config:     conf,
-		batchChan:  make(chan *ab.BroadcastMessage, conf.General.BatchSize),
-		messages:   []*ab.BroadcastMessage{&ab.BroadcastMessage{Data: []byte("genesis")}},
+		batchChan:  make(chan *cb.Envelope, conf.General.BatchSize),
+		messages:   genesisBlock.GetData().Data,
 		nextNumber: 0,
 	}
-}
 
-// Broadcast receives ordering requests by clients and sends back an
-// acknowledgement for each received message in order, indicating
-// success or type of failure
-func (b *broadcasterImpl) Broadcast(stream ab.AtomicBroadcast_BroadcastServer) error {
 	b.once.Do(func() {
 		// Send the genesis block to create the topic
 		// otherwise consumers will throw an exception.
@@ -63,6 +64,14 @@ func (b *broadcasterImpl) Broadcast(stream ab.AtomicBroadcast_BroadcastServer) e
 		// Spawn the goroutine that cuts blocks
 		go b.cutBlock(b.config.General.BatchTimeout, b.config.General.BatchSize)
 	})
+
+	return b
+}
+
+// Broadcast receives ordering requests by clients and sends back an
+// acknowledgement for each received message in order, indicating
+// success or type of failure
+func (b *broadcasterImpl) Broadcast(stream ab.AtomicBroadcast_BroadcastServer) error {
 	return b.recvRequests(stream)
 }
 
@@ -75,19 +84,29 @@ func (b *broadcasterImpl) Close() error {
 }
 
 func (b *broadcasterImpl) sendBlock() error {
-	block := &ab.Block{
-		Messages: b.messages,
-		Number:   b.nextNumber,
-		PrevHash: b.prevHash,
+	data := &cb.BlockData{
+		Data: b.messages,
 	}
-	logger.Debugf("Prepared block %d with %d messages (%+v)", block.Number, len(block.Messages), block)
+	block := &cb.Block{
+		Header: &cb.BlockHeader{
+			Number:       b.nextNumber,
+			PreviousHash: b.prevHash,
+			DataHash:     data.Hash(),
+		},
+		Data: data,
+	}
+	logger.Debugf("Prepared block %d with %d messages (%+v)", block.Header.Number, len(block.Data.Data), block)
 
-	b.messages = []*ab.BroadcastMessage{}
+	b.messages = [][]byte{}
 	b.nextNumber++
-	hash, data := hashBlock(block)
-	b.prevHash = hash
+	b.prevHash = block.Header.Hash()
 
-	return b.producer.Send(data)
+	blockBytes, err := proto.Marshal(block)
+	if err != nil {
+		logger.Fatalf("Error marshaling block: %s", err)
+	}
+
+	return b.producer.Send(blockBytes)
 }
 
 func (b *broadcasterImpl) cutBlock(period time.Duration, maxSize uint) {
@@ -96,17 +115,22 @@ func (b *broadcasterImpl) cutBlock(period time.Duration, maxSize uint) {
 	for {
 		select {
 		case msg := <-b.batchChan:
-			b.messages = append(b.messages, msg)
+			data, err := proto.Marshal(msg)
+			if err != nil {
+				panic(fmt.Errorf("Error marshaling what should be a valid proto message: %s", err))
+			}
+			b.messages = append(b.messages, data)
 			if len(b.messages) >= int(maxSize) {
-				if err := b.sendBlock(); err != nil {
-					panic(fmt.Errorf("Cannot communicate with Kafka broker: %s", err))
-				}
 				if !timer.Stop() {
 					<-timer.C
 				}
 				timer.Reset(period)
+				if err := b.sendBlock(); err != nil {
+					panic(fmt.Errorf("Cannot communicate with Kafka broker: %s", err))
+				}
 			}
 		case <-timer.C:
+			timer.Reset(period)
 			if len(b.messages) > 0 {
 				if err := b.sendBlock(); err != nil {
 					panic(fmt.Errorf("Cannot communicate with Kafka broker: %s", err))
@@ -126,12 +150,12 @@ func (b *broadcasterImpl) recvRequests(stream ab.AtomicBroadcast_BroadcastServer
 		}
 
 		b.batchChan <- msg
-		reply.Status = ab.Status_SUCCESS // TODO This shouldn't always be a success
+		reply.Status = cb.Status_SUCCESS // TODO This shouldn't always be a success
 
 		if err := stream.Send(reply); err != nil {
 			logger.Info("Cannot send broadcast reply to client")
-			return err
 		}
-		logger.Debugf("Sent broadcast reply %v to client", reply.Status.String())
+		logger.Debugf("Sent broadcast reply %s to client", reply.Status.String())
+
 	}
 }

@@ -19,8 +19,10 @@ package main
 import (
 	"fmt"
 
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
-	"github.com/hyperledger/fabric/orderer/config"
+	"github.com/hyperledger/fabric/orderer/common/bootstrap/static"
+	"github.com/hyperledger/fabric/orderer/localconfig"
+	cb "github.com/hyperledger/fabric/protos/common"
+	ab "github.com/hyperledger/fabric/protos/orderer"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
@@ -41,6 +43,7 @@ func (r *deliverClient) seekOldest() error {
 			Seek: &ab.SeekInfo{
 				Start:      ab.SeekInfo_OLDEST,
 				WindowSize: r.windowSize,
+				ChainID:    static.TestChainID,
 			},
 		},
 	})
@@ -52,6 +55,7 @@ func (r *deliverClient) seekNewest() error {
 			Seek: &ab.SeekInfo{
 				Start:      ab.SeekInfo_NEWEST,
 				WindowSize: r.windowSize,
+				ChainID:    static.TestChainID,
 			},
 		},
 	})
@@ -64,6 +68,7 @@ func (r *deliverClient) seek(blockNumber uint64) error {
 				Start:           ab.SeekInfo_SPECIFIED,
 				SpecifiedNumber: blockNumber,
 				WindowSize:      r.windowSize,
+				ChainID:         static.TestChainID,
 			},
 		},
 	})
@@ -73,12 +78,13 @@ func (r *deliverClient) readUntilClose() {
 	for {
 		msg, err := r.client.Recv()
 		if err != nil {
+			fmt.Println("Error receiving:", err)
 			return
 		}
 
 		switch t := msg.Type.(type) {
 		case *ab.DeliverResponse_Error:
-			if t.Error == ab.Status_SUCCESS {
+			if t.Error == cb.Status_SUCCESS {
 				fmt.Println("ERROR! Received success in error field")
 				return
 			}
@@ -88,7 +94,7 @@ func (r *deliverClient) readUntilClose() {
 			r.unAcknowledged++
 			if r.unAcknowledged >= r.windowSize/2 {
 				fmt.Println("Sending acknowledgement")
-				err = r.client.Send(&ab.DeliverUpdate{Type: &ab.DeliverUpdate_Acknowledgement{Acknowledgement: &ab.Acknowledgement{Number: t.Block.Number}}})
+				err = r.client.Send(&ab.DeliverUpdate{Type: &ab.DeliverUpdate_Acknowledgement{Acknowledgement: &ab.Acknowledgement{Number: t.Block.Header.Number}}})
 				if err != nil {
 					return
 				}

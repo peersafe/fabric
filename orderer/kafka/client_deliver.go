@@ -21,8 +21,9 @@ import (
 	"fmt"
 
 	"github.com/golang/protobuf/proto"
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
-	"github.com/hyperledger/fabric/orderer/config"
+	"github.com/hyperledger/fabric/orderer/localconfig"
+	cb "github.com/hyperledger/fabric/protos/common"
+	ab "github.com/hyperledger/fabric/protos/orderer"
 )
 
 type clientDelivererImpl struct {
@@ -88,7 +89,7 @@ func (cd *clientDelivererImpl) sendBlocks(stream ab.AtomicBroadcast_DeliverServe
 	var err error
 	var reply *ab.DeliverResponse
 	var upd *ab.DeliverUpdate
-	block := new(ab.Block)
+	block := new(cb.Block)
 	for {
 		select {
 		case <-cd.deadChan:
@@ -104,16 +105,16 @@ func (cd *clientDelivererImpl) sendBlocks(stream ab.AtomicBroadcast_DeliverServe
 				err = cd.processACK(t)
 			}
 			if err != nil {
-				var errorStatus ab.Status
+				var errorStatus cb.Status
 				// TODO Will need to flesh this out into
 				// a proper error handling system eventually.
 				switch err.Error() {
 				case seekOutOfRangeError:
-					errorStatus = ab.Status_NOT_FOUND
+					errorStatus = cb.Status_NOT_FOUND
 				case ackOutOfRangeError, windowOutOfRangeError:
-					errorStatus = ab.Status_BAD_REQUEST
+					errorStatus = cb.Status_BAD_REQUEST
 				default:
-					errorStatus = ab.Status_SERVICE_UNAVAILABLE
+					errorStatus = cb.Status_SERVICE_UNAVAILABLE
 				}
 				reply = new(ab.DeliverResponse)
 				reply.Type = &ab.DeliverResponse_Error{Error: errorStatus}
@@ -136,7 +137,7 @@ func (cd *clientDelivererImpl) sendBlocks(stream ab.AtomicBroadcast_DeliverServe
 					return fmt.Errorf("Failed to send block to the client: %s", err)
 				}
 				logger.Debugf("Sent block %v to client (prevHash: %v, messages: %v)\n",
-					block.Number, block.PrevHash, block.Messages)
+					block.Header.Number, block.Header.PreviousHash, block.Data.Data)
 			default:
 				// Return the push token if there are no messages
 				// available from the ordering service.

@@ -20,8 +20,11 @@ import (
 	"fmt"
 	"time"
 
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
-	"github.com/hyperledger/fabric/orderer/config"
+	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric/orderer/common/bootstrap/static"
+	"github.com/hyperledger/fabric/orderer/localconfig"
+	cb "github.com/hyperledger/fabric/protos/common"
+	ab "github.com/hyperledger/fabric/protos/orderer"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
@@ -36,7 +39,29 @@ func newBroadcastClient(client ab.AtomicBroadcast_BroadcastClient) *broadcastCli
 }
 
 func (s *broadcastClient) broadcast(transaction []byte) error {
-	return s.client.Send(&ab.BroadcastMessage{Data: transaction})
+	payload, err := proto.Marshal(&cb.Payload{
+		Header: &cb.Header{
+			ChainHeader: &cb.ChainHeader{
+				ChainID: static.TestChainID,
+			},
+		},
+		Data: transaction,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return s.client.Send(&cb.Envelope{Payload: payload})
+}
+
+func (s *broadcastClient) getAck() error {
+	msg, err := s.client.Recv()
+	if err != nil {
+		return err
+	}
+	if msg.Status != cb.Status_SUCCESS {
+		return fmt.Errorf("Got unexpected status: %v", msg.Status)
+	}
+	return nil
 }
 
 func main() {
@@ -56,4 +81,8 @@ func main() {
 
 	s := newBroadcastClient(client)
 	s.broadcast([]byte(fmt.Sprintf("Testing %v", time.Now())))
+	err = s.getAck()
+	if err != nil {
+		fmt.Printf("\nError: %v\n", err)
+	}
 }

@@ -25,7 +25,7 @@ General:
     BatchSize: 10
 
     # Queue Size: The maximum number of messages to allow pending from a gRPC client
-    # When Kafka is chosen as the OrdererType, this option is ignored.
+    # This option is currently ignored for the Kafka OrdererType.
     QueueSize: 10
 
     # Max Window Size: The maximum number of messages to for the orderer Deliver
@@ -36,7 +36,16 @@ General:
     ListenAddress: 127.0.0.1
 
     # Listen port: The port on which to bind to listen
-    ListenPort: 5151
+    ListenPort: 7050
+
+    # Genesis method: The method by which to retrieve/generate the genesis block
+    GenesisMethod: static
+
+    # Enable an HTTP service for Go "pprof" profiling as documented at
+    # https://golang.org/pkg/net/http/pprof
+    Profile:
+        Enabled: false
+        Address: 0.0.0.0:6060
 
 ################################################################################
 #

@@ -21,13 +21,17 @@ import (
 	"io"
 	"strconv"
 
-	ab "github.com/hyperledger/fabric/orderer/atomicbroadcast"
+	"github.com/hyperledger/fabric/orderer/common/bootstrap/static"
+	cb "github.com/hyperledger/fabric/protos/common"
+	ab "github.com/hyperledger/fabric/protos/orderer"
+
+	"github.com/golang/protobuf/proto"
 	context "golang.org/x/net/context"
 )
 
 func (c *clientImpl) broadcast() {
 	var count int
-	message := &ab.BroadcastMessage{} // Has a Data field
+	message := &cb.Envelope{} // Has a Data field
 	tokenChan := make(chan struct{}, c.config.count)
 
 	stream, err := c.rpc.Broadcast(context.Background())
@@ -47,12 +51,23 @@ func (c *clientImpl) broadcast() {
 			logger.Info("Client shutting down")
 			return
 		case tokenChan <- struct{}{}:
-			message.Data = []byte(strconv.Itoa(count))
-			err := stream.Send(message)
+			payload, err := proto.Marshal(&cb.Payload{
+				Header: &cb.Header{
+					ChainHeader: &cb.ChainHeader{
+						ChainID: static.TestChainID,
+					},
+				},
+				Data: []byte(strconv.Itoa(count)),
+			})
+			if err != nil {
+				panic(err)
+			}
+			message.Payload = payload
+			err = stream.Send(message)
 			if err != nil {
 				logger.Info("Failed to send broadcast message to orderer:", err)
 			}
-			logger.Debugf("Sent broadcast message \"%s\" to orderer\n", message.Data)
+			logger.Debugf("Sent broadcast message \"%v\" to orderer\n", message)
 			count++
 		}
 	}
