@@ -17,190 +17,178 @@ limitations under the License.
 package deliver
 
 import (
-	"github.com/hyperledger/fabric/orderer/multichain"
-	"github.com/hyperledger/fabric/orderer/rawledger"
+	"github.com/hyperledger/fabric/common/policies"
+	"github.com/hyperledger/fabric/orderer/common/filter"
+	"github.com/hyperledger/fabric/orderer/common/sigfilter"
+	"github.com/hyperledger/fabric/orderer/ledger"
 	cb "github.com/hyperledger/fabric/protos/common"
 	ab "github.com/hyperledger/fabric/protos/orderer"
 	"github.com/op/go-logging"
+
+	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric/protos/utils"
 )
 
 var logger = logging.MustGetLogger("orderer/common/deliver")
 
-func init() {
-	logging.SetLevel(logging.DEBUG, "")
-}
-
+// Handler defines an interface which handles Deliver requests
 type Handler interface {
 	Handle(srv ab.AtomicBroadcast_DeliverServer) error
 }
 
-type DeliverServer struct {
-	ml        multichain.Manager
-	maxWindow int
+// SupportManager provides a way for the Handler to look up the Support for a chain
+type SupportManager interface {
+	GetChain(chainID string) (Support, bool)
 }
 
-func NewHandlerImpl(ml multichain.Manager, maxWindow int) Handler {
-	return &DeliverServer{
-		ml:        ml,
-		maxWindow: maxWindow,
+// Support provides the backing resources needed to support deliver on a chain
+type Support interface {
+	// PolicyManager returns the current policy manager as specified by the chain configuration
+	PolicyManager() policies.Manager
+
+	// Reader returns the chain Reader for the chain
+	Reader() ledger.Reader
+}
+
+type deliverServer struct {
+	sm SupportManager
+}
+
+// NewHandlerImpl creates an implementation of the Handler interface
+func NewHandlerImpl(sm SupportManager) Handler {
+	return &deliverServer{
+		sm: sm,
 	}
 }
 
-func (ds *DeliverServer) Handle(srv ab.AtomicBroadcast_DeliverServer) error {
-	logger.Debugf("Starting new Deliver loop")
-	d := newDeliverer(ds, srv)
-	return d.recv()
-
-}
-
-type deliverer struct {
-	ds              *DeliverServer
-	srv             ab.AtomicBroadcast_DeliverServer
-	cursor          rawledger.Iterator
-	nextBlockNumber uint64
-	windowSize      uint64
-	lastAck         uint64
-	recvChan        chan *ab.DeliverUpdate
-	exitChan        chan struct{}
-}
-
-func newDeliverer(ds *DeliverServer, srv ab.AtomicBroadcast_DeliverServer) *deliverer {
-	d := &deliverer{
-		ds:       ds,
-		srv:      srv,
-		exitChan: make(chan struct{}),
-		recvChan: make(chan *ab.DeliverUpdate),
-	}
-	go d.main()
-	return d
-}
-
-func (d *deliverer) halt() {
-	close(d.exitChan)
-}
-
-func (d *deliverer) main() {
-	var signal <-chan struct{}
+func (ds *deliverServer) Handle(srv ab.AtomicBroadcast_DeliverServer) error {
+	logger.Debugf("Starting new deliver loop")
 	for {
-		select {
-		case update := <-d.recvChan:
-			logger.Debugf("Receiving message %v", update)
-			switch t := update.Type.(type) {
-			case *ab.DeliverUpdate_Acknowledgement:
-				logger.Debugf("Received acknowledgement from client")
-				d.lastAck = t.Acknowledgement.Number
-			case *ab.DeliverUpdate_Seek:
-				if !d.processUpdate(t.Seek) {
-					return
-				}
-			case nil:
-				logger.Errorf("Nil update")
-				close(d.exitChan)
-				return
-			default:
-				logger.Errorf("Unknown type: %T:%v", t, t)
-				close(d.exitChan)
-				return
-			}
-		case <-signal:
-			block, status := d.cursor.Next()
-			if status != cb.Status_SUCCESS {
-				logger.Errorf("Error reading from channel, cause was: %v", status)
-				if !d.sendErrorReply(status) {
-					return
-				}
-				d.cursor = nil
-			} else {
-				d.nextBlockNumber = block.Header.Number + 1
-				if !d.sendBlockReply(block) {
-					return
-				}
-			}
-		case <-d.exitChan:
-			return
-		}
-
-		if d.cursor == nil {
-			signal = nil
-			continue
-		}
-
-		if d.lastAck+d.windowSize < d.nextBlockNumber {
-			signal = nil
-			continue
-		}
-
-		logger.Debugf("Room for more blocks, activating channel")
-		signal = d.cursor.ReadyChan()
-	}
-}
-
-func (d *deliverer) recv() error {
-	for {
-		msg, err := d.srv.Recv()
+		logger.Debugf("Attempting to read seek info message")
+		envelope, err := srv.Recv()
 		if err != nil {
+			if logger.IsEnabledFor(logging.WARNING) {
+				logger.Warningf("Error reading from stream: %s", err)
+			}
 			return err
 		}
-		logger.Debugf("Received message %v", msg)
-		select {
-		case <-d.exitChan:
-			return nil // something has gone wrong enough we want to disconnect
-		case d.recvChan <- msg:
-			logger.Debugf("Sent update")
+		payload := &cb.Payload{}
+		if err = proto.Unmarshal(envelope.Payload, payload); err != nil {
+			if logger.IsEnabledFor(logging.WARNING) {
+				logger.Warningf("Received an envelope with no payload: %s", err)
+			}
+			return sendStatusReply(srv, cb.Status_BAD_REQUEST)
+		}
+
+		if payload.Header == nil {
+			if logger.IsEnabledFor(logging.WARNING) {
+				logger.Warningf("Malformed envelope received with bad header")
+			}
+			return sendStatusReply(srv, cb.Status_BAD_REQUEST)
+		}
+
+		chdr, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader)
+		if err != nil {
+			logger.Error(err)
+			return err
+		}
+
+		chain, ok := ds.sm.GetChain(chdr.ChannelId)
+		if !ok {
+			// Note, we log this at DEBUG because SDKs will poll waiting for channels to be created
+			// So we would expect our log to be somewhat flooded with these
+			if logger.IsEnabledFor(logging.DEBUG) {
+				logger.Debugf("Client request for channel %s not found", chdr.ChannelId)
+			}
+			return sendStatusReply(srv, cb.Status_NOT_FOUND)
+		}
+
+		sf := sigfilter.New(policies.ChannelReaders, chain.PolicyManager())
+		result, _ := sf.Apply(envelope)
+		if result != filter.Forward {
+			if logger.IsEnabledFor(logging.WARNING) {
+				logger.Warningf("Received unauthorized deliver request for channel %s", chdr.ChannelId)
+			}
+			return sendStatusReply(srv, cb.Status_FORBIDDEN)
+		}
+
+		seekInfo := &ab.SeekInfo{}
+		if err = proto.Unmarshal(payload.Data, seekInfo); err != nil {
+			if logger.IsEnabledFor(logging.WARNING) {
+				logger.Warningf("Received a signed deliver request with malformed seekInfo payload: %s", err)
+			}
+			return sendStatusReply(srv, cb.Status_BAD_REQUEST)
+		}
+
+		if seekInfo.Start == nil || seekInfo.Stop == nil {
+			if logger.IsEnabledFor(logging.WARNING) {
+				logger.Warningf("Received seekInfo message with missing start or stop %v, %v", seekInfo.Start, seekInfo.Stop)
+			}
+			return sendStatusReply(srv, cb.Status_BAD_REQUEST)
+		}
+
+		if logger.IsEnabledFor(logging.DEBUG) {
+			logger.Debugf("Received seekInfo (%p)  %v for chain %s", seekInfo, seekInfo, chdr.ChannelId)
+		}
+
+		cursor, number := chain.Reader().Iterator(seekInfo.Start)
+		var stopNum uint64
+		switch stop := seekInfo.Stop.Type.(type) {
+		case *ab.SeekPosition_Oldest:
+			stopNum = number
+		case *ab.SeekPosition_Newest:
+			stopNum = chain.Reader().Height() - 1
+		case *ab.SeekPosition_Specified:
+			stopNum = stop.Specified.Number
+		}
+
+		for {
+			if seekInfo.Behavior == ab.SeekInfo_BLOCK_UNTIL_READY {
+				<-cursor.ReadyChan()
+			} else {
+				select {
+				case <-cursor.ReadyChan():
+				default:
+					return sendStatusReply(srv, cb.Status_NOT_FOUND)
+				}
+			}
+
+			block, status := cursor.Next()
+			if status != cb.Status_SUCCESS {
+				logger.Errorf("Error reading from channel, cause was: %v", status)
+				return sendStatusReply(srv, status)
+			}
+
+			if logger.IsEnabledFor(logging.DEBUG) {
+				logger.Debugf("Delivering block for (%p) channel: %s", seekInfo, chdr.ChannelId)
+			}
+			if err := sendBlockReply(srv, block); err != nil {
+				return err
+			}
+
+			if stopNum == block.Header.Number {
+				break
+			}
+		}
+
+		if err := sendStatusReply(srv, cb.Status_SUCCESS); err != nil {
+			return err
+		}
+		if logger.IsEnabledFor(logging.DEBUG) {
+			logger.Debugf("Done delivering for (%p), waiting for new SeekInfo", seekInfo)
 		}
 	}
 }
 
-func (d *deliverer) sendErrorReply(status cb.Status) bool {
-	err := d.srv.Send(&ab.DeliverResponse{
-		Type: &ab.DeliverResponse_Error{Error: status},
+func sendStatusReply(srv ab.AtomicBroadcast_DeliverServer, status cb.Status) error {
+	return srv.Send(&ab.DeliverResponse{
+		Type: &ab.DeliverResponse_Status{Status: status},
 	})
-
-	if err != nil {
-		close(d.exitChan)
-		return false
-	}
-
-	return true
 
 }
 
-func (d *deliverer) sendBlockReply(block *cb.Block) bool {
-	err := d.srv.Send(&ab.DeliverResponse{
+func sendBlockReply(srv ab.AtomicBroadcast_DeliverServer, block *cb.Block) error {
+	return srv.Send(&ab.DeliverResponse{
 		Type: &ab.DeliverResponse_Block{Block: block},
 	})
-
-	if err != nil {
-		close(d.exitChan)
-		return false
-	}
-
-	return true
-
-}
-
-func (d *deliverer) processUpdate(update *ab.SeekInfo) bool {
-	if d.cursor != nil {
-		d.cursor = nil
-	}
-	logger.Debugf("Updating properties for client")
-
-	if update == nil || update.WindowSize == 0 || update.WindowSize > uint64(d.ds.maxWindow) || update.ChainID == "" {
-		close(d.exitChan)
-		return d.sendErrorReply(cb.Status_BAD_REQUEST)
-	}
-
-	chain, ok := d.ds.ml.GetChain(update.ChainID)
-	if !ok {
-		return d.sendErrorReply(cb.Status_NOT_FOUND)
-	}
-
-	// XXX add deliver authorization checking
-
-	d.windowSize = update.WindowSize
-
-	d.cursor, d.nextBlockNumber = chain.Reader().Iterator(update.Start, update.SpecifiedNumber)
-	d.lastAck = d.nextBlockNumber - 1
-
-	return true
 }

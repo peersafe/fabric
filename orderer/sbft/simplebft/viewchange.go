@@ -31,14 +31,15 @@ func (s *SBFT) sendViewChange() {
 	log.Noticef("replica %d: sending viewchange for view %d", s.id, s.view)
 
 	var q, p []*Subject
-	if s.cur.sentCommit {
+	if s.cur.prepared {
 		p = append(p, &s.cur.subject)
 	}
 	if s.cur.preprep != nil {
 		q = append(q, &s.cur.subject)
 	}
 
-	checkpoint := *s.sys.LastBatch()
+	// TODO fix batches synchronization as we send no payload here
+	checkpoint := *s.sys.LastBatch(s.chainId)
 	checkpoint.Payloads = nil // don't send the big payload
 
 	vc := &ViewChange{
@@ -50,9 +51,9 @@ func (s *SBFT) sendViewChange() {
 	svc := s.sign(vc)
 	s.viewChangeTimer.Cancel()
 	s.cur.timeout.Cancel()
-	s.broadcast(&Msg{&Msg_ViewChange{svc}})
 
-	s.processNewView()
+	s.sys.Persist(s.chainId, viewchange, svc)
+	s.broadcast(&Msg{&Msg_ViewChange{svc}})
 }
 
 func (s *SBFT) cancelViewChangeTimer() {
@@ -84,6 +85,13 @@ func (s *SBFT) handleViewChange(svc *Signed, src uint64) {
 	s.replicaState[src].signedViewchange = svc
 
 	min := vc.View
+
+	//amplify current primary abdication
+	if s.view == min-1 && s.primaryID() == src {
+		s.sendViewChange()
+		return
+	}
+
 	quorum := 0
 	for _, state := range s.replicaState {
 		if state.viewchange != nil {
@@ -104,8 +112,8 @@ func (s *SBFT) handleViewChange(svc *Signed, src uint64) {
 		}
 	}
 
-	if quorum == s.noFaultyQuorum() {
-		log.Noticef("replica %d: received 2f+1 view change messages, starting view change timer", s.id)
+	if quorum == s.viewChangeQuorum() {
+		log.Noticef("replica %d: received view change quorum, starting view change timer", s.id)
 		s.viewChangeTimer = s.sys.Timer(s.viewChangeTimeout, func() {
 			s.viewChangeTimeout *= 2
 			log.Noticef("replica %d: view change timed out, sending next", s.id)

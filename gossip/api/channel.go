@@ -17,21 +17,18 @@ limitations under the License.
 package api
 
 import (
-	"time"
-
 	"github.com/hyperledger/fabric/gossip/common"
 )
 
 // SecurityAdvisor defines an external auxiliary object
 // that provides security and identity related capabilities
 type SecurityAdvisor interface {
-	// IsInMyOrg returns whether the given peer's certificate represents
-	// a peer in the invoker's organization
-	IsInMyOrg(PeerCert) bool
-
-	// Verify verifies a JoinChannelMessage, returns nil on success,
-	// and an error on failure
-	Verify(JoinChannelMessage) error
+	// OrgByPeerIdentity returns the OrgIdentityType
+	// of a given peer identity.
+	// If any error occurs, nil is returned.
+	// This method does not validate peerIdentity.
+	// This validation is supposed to be done appropriately during the execution flow.
+	OrgByPeerIdentity(PeerIdentityType) OrgIdentityType
 }
 
 // ChannelNotifier is implemented by the gossip component and is used for the peer
@@ -45,19 +42,22 @@ type ChannelNotifier interface {
 // among the peers
 type JoinChannelMessage interface {
 
-	// GetTimestamp returns the timestamp of the message's creation
-	GetTimestamp() time.Time
+	// SequenceNumber returns the sequence number of the configuration block
+	// the JoinChannelMessage originated from
+	SequenceNumber() uint64
 
-	// Members returns all the peers that are in the channel
-	Members() []ChannelMember
+	// Members returns the organizations of the channel
+	Members() []OrgIdentityType
+
+	// AnchorPeersOf returns the anchor peers of the given organization
+	AnchorPeersOf(org OrgIdentityType) []AnchorPeer
 }
 
-// ChannelMember is a peer's certificate and endpoint (host:port)
-type ChannelMember struct {
-	Cert PeerCert // Cert defines the certificate of the remote peer
-	Host string   // Host is the hostname/ip address of the remote peer
-	Port int      // Port is the port the remote peer is listening on
+// AnchorPeer is an anchor peer's certificate and endpoint (host:port)
+type AnchorPeer struct {
+	Host string // Host is the hostname/ip address of the remote peer
+	Port int    // Port is the port the remote peer is listening on
 }
 
-// PeerCert defines the cryptographic identity of a peer
-type PeerCert []byte
+// OrgIdentityType defines the identity of an organization
+type OrgIdentityType []byte

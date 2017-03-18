@@ -21,7 +21,7 @@ import (
 	"strings"
 
 	"github.com/fsouza/go-dockerclient"
-	"github.com/hyperledger/fabric/metadata"
+	"github.com/hyperledger/fabric/common/metadata"
 	"github.com/spf13/viper"
 )
 
@@ -58,7 +58,8 @@ func getArch() string {
 func parseDockerfileTemplate(template string) string {
 	r := strings.NewReplacer(
 		"$(ARCH)", getArch(),
-		"$(PROJECT_VERSION)", metadata.Version)
+		"$(PROJECT_VERSION)", metadata.Version,
+		"$(BASE_VERSION)", metadata.BaseVersion)
 
 	return r.Replace(template)
 }

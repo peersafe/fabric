@@ -17,10 +17,9 @@ limitations under the License.
 package clilogging
 
 import (
-	"fmt"
-
-	"github.com/hyperledger/fabric/core/peer"
+	"github.com/hyperledger/fabric/peer/common"
 	pb "github.com/hyperledger/fabric/protos/peer"
+
 	"github.com/spf13/cobra"
 	"golang.org/x/net/context"
 )
@@ -44,23 +43,19 @@ func getLevel(cmd *cobra.Command, args []string) (err error) {
 	if err != nil {
 		logger.Warningf("Error: %s", err)
 	} else {
-		clientConn, err := peer.NewPeerClientConnection()
+		adminClient, err := common.GetAdminClient()
 		if err != nil {
-			logger.Infof("Error trying to connect to local peer: %s", err)
-			err = fmt.Errorf("Error trying to connect to local peer: %s", err)
-			fmt.Println(&pb.ServerStatus{Status: pb.ServerStatus_UNKNOWN})
+			logger.Warningf("%s", err)
 			return err
 		}
 
-		serverClient := pb.NewAdminClient(clientConn)
-
-		logResponse, err := serverClient.GetModuleLogLevel(context.Background(), &pb.LogLevelRequest{LogModule: args[0]})
+		logResponse, err := adminClient.GetModuleLogLevel(context.Background(), &pb.LogLevelRequest{LogModule: args[0]})
 
 		if err != nil {
 			logger.Warningf("Error retrieving log level")
 			return err
 		}
-		logger.Infof("Current log level for module '%s': %s", logResponse.LogModule, logResponse.LogLevel)
+		logger.Infof("Current log level for peer module '%s': %s", logResponse.LogModule, logResponse.LogLevel)
 	}
 	return err
 }

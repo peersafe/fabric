@@ -17,7 +17,7 @@ limitations under the License.
 package clilogging
 
 import (
-	"fmt"
+	"github.com/hyperledger/fabric/core/errors"
 
 	"github.com/op/go-logging"
 	"github.com/spf13/cobra"
@@ -28,17 +28,19 @@ func checkLoggingCmdParams(cmd *cobra.Command, args []string) error {
 
 	// check that at least one parameter is passed in
 	if len(args) == 0 {
-		return fmt.Errorf("no parameters provided")
+		err = errors.ErrorWithCallstack("Logging", "NoParameters", "No parameters provided.")
+		return err
 	}
 
 	if cmd.Name() == "setlevel" {
+		// check that log level parameter is provided
 		if len(args) == 1 {
-			err = fmt.Errorf("no log level provided")
+			err = errors.ErrorWithCallstack("Logging", "NoLevelParameter", "No log level provided.")
 		} else {
 			// check that log level is valid. if not, err is set
 			_, err = logging.LogLevel(args[1])
 			if err != nil {
-				err = fmt.Errorf("%s - %s", err, args[1])
+				err = errors.ErrorWithCallstack("Logging", "InvalidLevel", "Invalid log level provided - %s", args[1])
 			}
 		}
 	}

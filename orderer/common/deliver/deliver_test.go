@@ -21,46 +21,37 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hyperledger/fabric/orderer/common/bootstrap/static"
-	"github.com/hyperledger/fabric/orderer/common/broadcastfilter"
-	"github.com/hyperledger/fabric/orderer/common/configtx"
-	"github.com/hyperledger/fabric/orderer/common/policies"
-	"github.com/hyperledger/fabric/orderer/multichain"
-	"github.com/hyperledger/fabric/orderer/rawledger"
-	"github.com/hyperledger/fabric/orderer/rawledger/ramledger"
+	"github.com/hyperledger/fabric/common/configtx/tool/provisional"
+	mockpolicies "github.com/hyperledger/fabric/common/mocks/policies"
+	"github.com/hyperledger/fabric/common/policies"
+	"github.com/hyperledger/fabric/orderer/ledger"
+	ramledger "github.com/hyperledger/fabric/orderer/ledger/ram"
 	cb "github.com/hyperledger/fabric/protos/common"
 	ab "github.com/hyperledger/fabric/protos/orderer"
-
+	"github.com/hyperledger/fabric/protos/utils"
+	logging "github.com/op/go-logging"
 	"google.golang.org/grpc"
 )
 
-var genesisBlock *cb.Block
+var genesisBlock = cb.NewBlock(0, nil)
 
 var systemChainID = "systemChain"
 
 const ledgerSize = 10
 
 func init() {
-	bootstrapper := static.New()
-	var err error
-	genesisBlock, err = bootstrapper.GenesisBlock()
-	if err != nil {
-		panic("Error intializing static bootstrap genesis block")
-	}
+	logging.SetLevel(logging.DEBUG, "")
 }
-
-// MagicLargestWindow is used as the default max window size for initializing the deliver service
-const MagicLargestWindow int = 1000
 
 type mockD struct {
 	grpc.ServerStream
-	recvChan chan *ab.DeliverUpdate
+	recvChan chan *cb.Envelope
 	sendChan chan *ab.DeliverResponse
 }
 
 func newMockD() *mockD {
 	return &mockD{
-		recvChan: make(chan *ab.DeliverUpdate),
+		recvChan: make(chan *cb.Envelope),
 		sendChan: make(chan *ab.DeliverResponse),
 	}
 }
@@ -70,7 +61,7 @@ func (m *mockD) Send(br *ab.DeliverResponse) error {
 	return nil
 }
 
-func (m *mockD) Recv() (*ab.DeliverUpdate, error) {
+func (m *mockD) Recv() (*cb.Envelope, error) {
 	msg, ok := <-m.recvChan
 	if !ok {
 		return msg, fmt.Errorf("Channel closed")
@@ -78,102 +69,130 @@ func (m *mockD) Recv() (*ab.DeliverUpdate, error) {
 	return msg, nil
 }
 
-type mockMultichainManager struct {
-	chains map[string]*mockChainSupport
+type mockSupportManager struct {
+	chains map[string]*mockSupport
 }
 
-func (mm *mockMultichainManager) GetChain(chainID string) (multichain.ChainSupport, bool) {
+func (mm *mockSupportManager) GetChain(chainID string) (Support, bool) {
 	cs, ok := mm.chains[chainID]
 	return cs, ok
 }
 
-type mockChainSupport struct {
-	ledger rawledger.ReadWriter
+type mockSupport struct {
+	ledger        ledger.ReadWriter
+	policyManager *mockpolicies.Manager
 }
 
-func (mcs *mockChainSupport) ConfigManager() configtx.Manager {
-	panic("Unimplemented")
+func (mcs *mockSupport) PolicyManager() policies.Manager {
+	return mcs.policyManager
 }
 
-func (mcs *mockChainSupport) PolicyManager() policies.Manager {
-	panic("Unimplemented")
-}
-
-func (mcs *mockChainSupport) Filters() *broadcastfilter.RuleSet {
-	panic("Unimplemented")
-}
-
-func (mcs *mockChainSupport) Reader() rawledger.Reader {
+func (mcs *mockSupport) Reader() ledger.Reader {
 	return mcs.ledger
 }
 
-func (mcs *mockChainSupport) Chain() multichain.Chain {
-	panic("Unimplemented")
+func NewRAMLedger() ledger.ReadWriter {
+	rlf := ramledger.New(ledgerSize + 1)
+	rl, _ := rlf.GetOrCreate(provisional.TestChainID)
+	rl.Append(genesisBlock)
+	return rl
 }
 
-func newMockMultichainManager() *mockMultichainManager {
-	_, rl := ramledger.New(ledgerSize, genesisBlock)
-	mm := &mockMultichainManager{
-		chains: make(map[string]*mockChainSupport),
+func newMockMultichainManager() *mockSupportManager {
+	rl := NewRAMLedger()
+	mm := &mockSupportManager{
+		chains: make(map[string]*mockSupport),
 	}
-	mm.chains[string(systemChainID)] = &mockChainSupport{
-		ledger: rl,
+	mm.chains[systemChainID] = &mockSupport{
+		ledger:        rl,
+		policyManager: &mockpolicies.Manager{Policy: &mockpolicies.Policy{}},
 	}
 	return mm
+}
+
+var seekOldest = &ab.SeekPosition{Type: &ab.SeekPosition_Oldest{Oldest: &ab.SeekOldest{}}}
+var seekNewest = &ab.SeekPosition{Type: &ab.SeekPosition_Newest{Newest: &ab.SeekNewest{}}}
+
+func seekSpecified(number uint64) *ab.SeekPosition {
+	return &ab.SeekPosition{Type: &ab.SeekPosition_Specified{Specified: &ab.SeekSpecified{Number: number}}}
+}
+
+func makeSeek(chainID string, seekInfo *ab.SeekInfo) *cb.Envelope {
+	return &cb.Envelope{
+		Payload: utils.MarshalOrPanic(&cb.Payload{
+			Header: &cb.Header{
+				ChannelHeader: utils.MarshalOrPanic(&cb.ChannelHeader{
+					ChannelId: chainID,
+				}),
+				SignatureHeader: utils.MarshalOrPanic(&cb.SignatureHeader{}),
+			},
+			Data: utils.MarshalOrPanic(seekInfo),
+		}),
+	}
 }
 
 func TestOldestSeek(t *testing.T) {
 	mm := newMockMultichainManager()
 	for i := 1; i < ledgerSize; i++ {
-		mm.chains[string(systemChainID)].ledger.Append([]*cb.Envelope{&cb.Envelope{Payload: []byte(fmt.Sprintf("%d", i))}}, nil)
+		l := mm.chains[systemChainID].ledger
+		l.Append(ledger.CreateNextBlock(l, []*cb.Envelope{&cb.Envelope{Payload: []byte(fmt.Sprintf("%d", i))}}))
 	}
 
 	m := newMockD()
 	defer close(m.recvChan)
-	ds := NewHandlerImpl(mm, MagicLargestWindow)
+	ds := NewHandlerImpl(mm)
 
 	go ds.Handle(m)
 
-	m.recvChan <- &ab.DeliverUpdate{Type: &ab.DeliverUpdate_Seek{Seek: &ab.SeekInfo{WindowSize: uint64(MagicLargestWindow), Start: ab.SeekInfo_OLDEST, ChainID: systemChainID}}}
+	m.recvChan <- makeSeek(systemChainID, &ab.SeekInfo{Start: seekOldest, Stop: seekNewest, Behavior: ab.SeekInfo_BLOCK_UNTIL_READY})
 
-	count := 0
+	count := uint64(0)
 	for {
 		select {
 		case deliverReply := <-m.sendChan:
 			if deliverReply.GetBlock() == nil {
-				t.Fatalf("Received an error on the reply channel")
+				if deliverReply.GetStatus() != cb.Status_SUCCESS {
+					t.Fatalf("Received an error on the reply channel")
+				}
+				if count != ledgerSize {
+					t.Fatalf("Expected %d blocks but got %d", ledgerSize, count)
+				}
+				return
+			}
+			if deliverReply.GetBlock().Header.Number != count {
+				t.Fatalf("Expected block %d but got block %d", count, deliverReply.GetBlock().Header.Number)
 			}
 		case <-time.After(time.Second):
 			t.Fatalf("Timed out waiting to get all blocks")
 		}
 		count++
-		if count == ledgerSize {
-			break
-		}
 	}
 }
 
 func TestNewestSeek(t *testing.T) {
 	mm := newMockMultichainManager()
 	for i := 1; i < ledgerSize; i++ {
-		mm.chains[string(systemChainID)].ledger.Append([]*cb.Envelope{&cb.Envelope{Payload: []byte(fmt.Sprintf("%d", i))}}, nil)
+		l := mm.chains[systemChainID].ledger
+		l.Append(ledger.CreateNextBlock(l, []*cb.Envelope{&cb.Envelope{Payload: []byte(fmt.Sprintf("%d", i))}}))
 	}
 
 	m := newMockD()
 	defer close(m.recvChan)
-	ds := NewHandlerImpl(mm, MagicLargestWindow)
+	ds := NewHandlerImpl(mm)
 
 	go ds.Handle(m)
 
-	m.recvChan <- &ab.DeliverUpdate{Type: &ab.DeliverUpdate_Seek{Seek: &ab.SeekInfo{WindowSize: uint64(MagicLargestWindow), Start: ab.SeekInfo_NEWEST, ChainID: systemChainID}}}
+	m.recvChan <- makeSeek(systemChainID, &ab.SeekInfo{Start: seekNewest, Stop: seekNewest, Behavior: ab.SeekInfo_BLOCK_UNTIL_READY})
 
 	select {
-	case blockReply := <-m.sendChan:
-		if blockReply.GetBlock() == nil {
-			t.Fatalf("Received an error on the reply channel")
+	case deliverReply := <-m.sendChan:
+		if deliverReply.GetBlock() == nil {
+			if deliverReply.GetStatus() != cb.Status_SUCCESS {
+				t.Fatalf("Received an error on the reply channel")
+			}
+			return
 		}
-
-		if blockReply.GetBlock().Header.Number != uint64(ledgerSize-1) {
+		if deliverReply.GetBlock().Header.Number != uint64(ledgerSize-1) {
 			t.Fatalf("Expected only the most recent block")
 		}
 	case <-time.After(time.Second):
@@ -184,25 +203,60 @@ func TestNewestSeek(t *testing.T) {
 func TestSpecificSeek(t *testing.T) {
 	mm := newMockMultichainManager()
 	for i := 1; i < ledgerSize; i++ {
-		mm.chains[string(systemChainID)].ledger.Append([]*cb.Envelope{&cb.Envelope{Payload: []byte(fmt.Sprintf("%d", i))}}, nil)
+		l := mm.chains[systemChainID].ledger
+		l.Append(ledger.CreateNextBlock(l, []*cb.Envelope{&cb.Envelope{Payload: []byte(fmt.Sprintf("%d", i))}}))
 	}
 
 	m := newMockD()
 	defer close(m.recvChan)
-	ds := NewHandlerImpl(mm, MagicLargestWindow)
+	ds := NewHandlerImpl(mm)
+	specifiedStart := uint64(3)
+	specifiedStop := uint64(7)
 
 	go ds.Handle(m)
 
-	m.recvChan <- &ab.DeliverUpdate{Type: &ab.DeliverUpdate_Seek{Seek: &ab.SeekInfo{WindowSize: uint64(MagicLargestWindow), Start: ab.SeekInfo_NEWEST, ChainID: systemChainID}}}
+	m.recvChan <- makeSeek(systemChainID, &ab.SeekInfo{Start: seekSpecified(specifiedStart), Stop: seekSpecified(specifiedStop), Behavior: ab.SeekInfo_BLOCK_UNTIL_READY})
+
+	count := uint64(0)
+	for {
+		select {
+		case deliverReply := <-m.sendChan:
+			if deliverReply.GetBlock() == nil {
+				if deliverReply.GetStatus() != cb.Status_SUCCESS {
+					t.Fatalf("Received an error on the reply channel")
+				}
+				return
+			}
+			if expected := specifiedStart + count; deliverReply.GetBlock().Header.Number != expected {
+				t.Fatalf("Expected block %d but got block %d", expected, deliverReply.GetBlock().Header.Number)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("Timed out waiting to get all blocks")
+		}
+		count++
+	}
+}
+
+func TestUnauthorizedSeek(t *testing.T) {
+	mm := newMockMultichainManager()
+	for i := 1; i < ledgerSize; i++ {
+		l := mm.chains[systemChainID].ledger
+		l.Append(ledger.CreateNextBlock(l, []*cb.Envelope{&cb.Envelope{Payload: []byte(fmt.Sprintf("%d", i))}}))
+	}
+	mm.chains[systemChainID].policyManager.Policy.Err = fmt.Errorf("Fail to evaluate policy")
+
+	m := newMockD()
+	defer close(m.recvChan)
+	ds := NewHandlerImpl(mm)
+
+	go ds.Handle(m)
+
+	m.recvChan <- makeSeek(systemChainID, &ab.SeekInfo{Start: seekSpecified(uint64(0)), Stop: seekSpecified(uint64(0)), Behavior: ab.SeekInfo_BLOCK_UNTIL_READY})
 
 	select {
-	case blockReply := <-m.sendChan:
-		if blockReply.GetBlock() == nil {
-			t.Fatalf("Received an error on the reply channel")
-		}
-
-		if blockReply.GetBlock().Header.Number != uint64(ledgerSize-1) {
-			t.Fatalf("Expected only the most recent block")
+	case deliverReply := <-m.sendChan:
+		if deliverReply.GetStatus() != cb.Status_FORBIDDEN {
+			t.Fatalf("Received wrong error on the reply channel")
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("Timed out waiting to get all blocks")
@@ -211,100 +265,111 @@ func TestSpecificSeek(t *testing.T) {
 
 func TestBadSeek(t *testing.T) {
 	mm := newMockMultichainManager()
-	for i := 1; i < 2*ledgerSize; i++ {
-		mm.chains[string(systemChainID)].ledger.Append([]*cb.Envelope{&cb.Envelope{Payload: []byte(fmt.Sprintf("%d", i))}}, nil)
-	}
-
-	m := newMockD()
-	defer close(m.recvChan)
-	ds := NewHandlerImpl(mm, MagicLargestWindow)
-
-	go ds.Handle(m)
-
-	m.recvChan <- &ab.DeliverUpdate{Type: &ab.DeliverUpdate_Seek{Seek: &ab.SeekInfo{WindowSize: uint64(MagicLargestWindow), Start: ab.SeekInfo_SPECIFIED, SpecifiedNumber: uint64(ledgerSize - 1), ChainID: systemChainID}}}
-
-	select {
-	case blockReply := <-m.sendChan:
-		if blockReply.GetError() != cb.Status_NOT_FOUND {
-			t.Fatalf("Received wrong error on the reply channel")
-		}
-	case <-time.After(time.Second):
-		t.Fatalf("Timed out waiting to get all blocks")
-	}
-
-	m.recvChan <- &ab.DeliverUpdate{Type: &ab.DeliverUpdate_Seek{Seek: &ab.SeekInfo{WindowSize: uint64(MagicLargestWindow), Start: ab.SeekInfo_SPECIFIED, SpecifiedNumber: uint64(3 * ledgerSize), ChainID: systemChainID}}}
-
-	select {
-	case blockReply := <-m.sendChan:
-		if blockReply.GetError() != cb.Status_NOT_FOUND {
-			t.Fatalf("Received wrong error on the reply channel")
-		}
-	case <-time.After(time.Second):
-		t.Fatalf("Timed out waiting to get all blocks")
-	}
-}
-
-func TestBadWindow(t *testing.T) {
-	mm := newMockMultichainManager()
-
-	m := newMockD()
-	defer close(m.recvChan)
-	ds := NewHandlerImpl(mm, MagicLargestWindow)
-
-	go ds.Handle(m)
-
-	m.recvChan <- &ab.DeliverUpdate{Type: &ab.DeliverUpdate_Seek{Seek: &ab.SeekInfo{WindowSize: uint64(MagicLargestWindow) * 2, Start: ab.SeekInfo_OLDEST, ChainID: systemChainID}}}
-
-	select {
-	case blockReply := <-m.sendChan:
-		if blockReply.GetError() != cb.Status_BAD_REQUEST {
-			t.Fatalf("Received wrong error on the reply channel")
-		}
-	case <-time.After(time.Second):
-		t.Fatalf("Timed out waiting to get all blocks")
-	}
-}
-
-func TestAck(t *testing.T) {
-	mm := newMockMultichainManager()
-	windowSize := uint64(2)
 	for i := 1; i < ledgerSize; i++ {
-		mm.chains[string(systemChainID)].ledger.Append([]*cb.Envelope{&cb.Envelope{Payload: []byte(fmt.Sprintf("%d", i))}}, nil)
+		l := mm.chains[systemChainID].ledger
+		l.Append(ledger.CreateNextBlock(l, []*cb.Envelope{&cb.Envelope{Payload: []byte(fmt.Sprintf("%d", i))}}))
 	}
 
 	m := newMockD()
 	defer close(m.recvChan)
-	ds := NewHandlerImpl(mm, MagicLargestWindow)
+	ds := NewHandlerImpl(mm)
 
 	go ds.Handle(m)
 
-	m.recvChan <- &ab.DeliverUpdate{Type: &ab.DeliverUpdate_Seek{Seek: &ab.SeekInfo{WindowSize: windowSize, Start: ab.SeekInfo_OLDEST, ChainID: systemChainID}}}
+	m.recvChan <- makeSeek(systemChainID, &ab.SeekInfo{Start: seekSpecified(uint64(3 * ledgerSize)), Stop: seekSpecified(uint64(3 * ledgerSize)), Behavior: ab.SeekInfo_BLOCK_UNTIL_READY})
 
-	count := uint64(0)
-	for {
-		select {
-		case blockReply := <-m.sendChan:
-			if blockReply.GetBlock() == nil {
-				t.Fatalf("Received an error on the reply channel")
-			}
-		case <-time.After(time.Second):
-			t.Fatalf("Timed out waiting to get all blocks")
+	select {
+	case deliverReply := <-m.sendChan:
+		if deliverReply.GetStatus() != cb.Status_NOT_FOUND {
+			t.Fatalf("Received wrong error on the reply channel")
 		}
-		count++
-		if count == windowSize {
-			select {
-			case <-m.sendChan:
-				t.Fatalf("Window size exceeded")
-			default:
-			}
-		}
+	case <-time.After(time.Second):
+		t.Fatalf("Timed out waiting to get all blocks")
+	}
+}
 
-		if count%windowSize == 0 {
-			m.recvChan <- &ab.DeliverUpdate{Type: &ab.DeliverUpdate_Acknowledgement{Acknowledgement: &ab.Acknowledgement{Number: count}}}
-		}
+func TestFailFastSeek(t *testing.T) {
+	mm := newMockMultichainManager()
+	for i := 1; i < ledgerSize; i++ {
+		l := mm.chains[systemChainID].ledger
+		l.Append(ledger.CreateNextBlock(l, []*cb.Envelope{&cb.Envelope{Payload: []byte(fmt.Sprintf("%d", i))}}))
+	}
 
-		if count == uint64(ledgerSize) {
-			break
+	m := newMockD()
+	defer close(m.recvChan)
+	ds := NewHandlerImpl(mm)
+
+	go ds.Handle(m)
+
+	m.recvChan <- makeSeek(systemChainID, &ab.SeekInfo{Start: seekSpecified(uint64(ledgerSize - 1)), Stop: seekSpecified(ledgerSize), Behavior: ab.SeekInfo_FAIL_IF_NOT_READY})
+
+	select {
+	case deliverReply := <-m.sendChan:
+		if deliverReply.GetBlock() == nil {
+			t.Fatalf("Expected to receive first block")
 		}
+	case <-time.After(time.Second):
+		t.Fatalf("Timed out waiting to get all blocks")
+	}
+
+	select {
+	case deliverReply := <-m.sendChan:
+		if deliverReply.GetStatus() != cb.Status_NOT_FOUND {
+			t.Fatalf("Expected to receive failure for second block")
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Timed out waiting to get all blocks")
+	}
+}
+
+func TestBlockingSeek(t *testing.T) {
+	mm := newMockMultichainManager()
+	for i := 1; i < ledgerSize; i++ {
+		l := mm.chains[systemChainID].ledger
+		l.Append(ledger.CreateNextBlock(l, []*cb.Envelope{&cb.Envelope{Payload: []byte(fmt.Sprintf("%d", i))}}))
+	}
+
+	m := newMockD()
+	defer close(m.recvChan)
+	ds := NewHandlerImpl(mm)
+
+	go ds.Handle(m)
+
+	m.recvChan <- makeSeek(systemChainID, &ab.SeekInfo{Start: seekSpecified(uint64(ledgerSize - 1)), Stop: seekSpecified(ledgerSize), Behavior: ab.SeekInfo_BLOCK_UNTIL_READY})
+
+	select {
+	case deliverReply := <-m.sendChan:
+		if deliverReply.GetBlock() == nil {
+			t.Fatalf("Expected to receive first block")
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Timed out waiting to get first block")
+	}
+
+	select {
+	case <-m.sendChan:
+		t.Fatalf("Should not have delivered an error or second block")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	l := mm.chains[systemChainID].ledger
+	l.Append(ledger.CreateNextBlock(l, []*cb.Envelope{&cb.Envelope{Payload: []byte(fmt.Sprintf("%d", ledgerSize+1))}}))
+
+	select {
+	case deliverReply := <-m.sendChan:
+		if deliverReply.GetBlock() == nil {
+			t.Fatalf("Expected to receive new block")
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Timed out waiting to get new block")
+	}
+
+	select {
+	case deliverReply := <-m.sendChan:
+		if deliverReply.GetStatus() != cb.Status_SUCCESS {
+			t.Fatalf("Expected delivery to complete")
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Timed out waiting to get all blocks")
 	}
 }

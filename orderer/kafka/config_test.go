@@ -17,38 +17,52 @@ limitations under the License.
 package kafka
 
 import (
+	"testing"
 	"time"
 
 	"github.com/Shopify/sarama"
+	genesisconfig "github.com/hyperledger/fabric/common/configtx/tool/localconfig"
 	"github.com/hyperledger/fabric/orderer/localconfig"
+	cb "github.com/hyperledger/fabric/protos/common"
 )
 
 var (
-	brokerID     = int32(0)
-	oldestOffset = int64(100)                            // The oldest block available on the broker
-	newestOffset = int64(1100)                           // The offset that will be assigned to the next block
-	middleOffset = (oldestOffset + newestOffset - 1) / 2 // Just an offset in the middle
+	testBrokerID     = int32(0)
+	testOldestOffset = int64(100)                                    // The oldest block available on the broker
+	testNewestOffset = int64(1100)                                   // The offset that will be assigned to the next block
+	testMiddleOffset = (testOldestOffset + testNewestOffset - 1) / 2 // Just an offset in the middle
 
 	// Amount of time to wait for block processing when doing time-based tests
 	// We generally want this value to be as small as possible so as to make tests execute faster
 	// But this may have to be bumped up in slower machines
-	timePadding = 200 * time.Millisecond
+	testTimePadding = 200 * time.Millisecond
 )
 
+var testGenesisConf = &genesisconfig.TopLevel{
+	Orderer: &genesisconfig.Orderer{
+		Kafka: genesisconfig.Kafka{
+			Brokers: []string{"127.0.0.1:9092"},
+		},
+	},
+}
+
 var testConf = &config.TopLevel{
-	General: config.General{
-		OrdererType:   "kafka",
-		BatchTimeout:  500 * time.Millisecond,
-		BatchSize:     100,
-		QueueSize:     100,
-		MaxWindowSize: 100,
-		ListenAddress: "127.0.0.1",
-		ListenPort:    7050,
-	},
 	Kafka: config.Kafka{
-		Brokers:     []string{"127.0.0.1:9092"},
-		Topic:       "test",
-		PartitionID: 0,
-		Version:     sarama.V0_9_0_1,
+		Retry: config.Retry{
+			Period: 3 * time.Second,
+			Stop:   60 * time.Second,
+		},
+		Verbose: false,
+		Version: sarama.V0_9_0_1,
 	},
+}
+
+func testClose(t *testing.T, x Closeable) {
+	if err := x.Close(); err != nil {
+		t.Fatal("Cannot close mock resource:", err)
+	}
+}
+
+func newTestEnvelope(content string) *cb.Envelope {
+	return &cb.Envelope{Payload: []byte(content)}
 }

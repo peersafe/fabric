@@ -1,22 +1,25 @@
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
+# Copyright London Stock Exchange Group All Rights Reserved.
 #
-#   http://www.apache.org/licenses/LICENSE-2.0
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an
-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied.  See the License for the
-# specific language governing permissions and limitations
-# under the License.
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 ifneq ($(shell uname),Darwin)
 DOCKER_RUN_FLAGS=--user=$(shell id -u)
+endif
+
+ifeq ($(shell uname -m),s390x)
+ifneq ($(shell id -u),0)
+DOCKER_RUN_FLAGS+=-v /etc/passwd:/etc/passwd:ro
+endif
 endif
 
 ifneq ($(http_proxy),)
@@ -53,6 +56,8 @@ DBUILD = docker build $(DOCKER_BUILD_FLAGS)
 DOCKER_TAG=$(ARCH)-$(PROJECT_VERSION)
 BASE_DOCKER_TAG=$(ARCH)-$(BASEIMAGE_RELEASE)
 
+BASE_DOCKER_LABEL=org.hyperledger.fabric
+
 DOCKER_GO_LDFLAGS += $(GO_LDFLAGS)
 DOCKER_GO_LDFLAGS += -linkmode external -extldflags '-static -lpthread'
 
@@ -82,6 +87,3 @@ DOCKER_GO_LDFLAGS += -linkmode external -extldflags '-static -lpthread'
 # file to differentiate different tags to fix FAB-1145
 #
 DUMMY = .dummy-$(DOCKER_TAG)
-
-
-

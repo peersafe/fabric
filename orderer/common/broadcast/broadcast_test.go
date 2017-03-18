@@ -17,70 +17,25 @@ limitations under the License.
 package broadcast
 
 import (
-	"bytes"
 	"fmt"
 	"testing"
+	"time"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/hyperledger/fabric/orderer/common/broadcastfilter"
-	"github.com/hyperledger/fabric/orderer/common/configtx"
-	"github.com/hyperledger/fabric/orderer/common/policies"
-	"github.com/hyperledger/fabric/orderer/multichain"
-	"github.com/hyperledger/fabric/orderer/rawledger"
+	"github.com/hyperledger/fabric/orderer/common/filter"
 	cb "github.com/hyperledger/fabric/protos/common"
 	ab "github.com/hyperledger/fabric/protos/orderer"
+	"github.com/hyperledger/fabric/protos/utils"
 
+	logging "github.com/op/go-logging"
+	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 )
 
-var systemChain = "systemChain"
-
-var configTx []byte
-
 func init() {
-	var err error
-	configTx, err = proto.Marshal(&cb.ConfigurationEnvelope{})
-	if err != nil {
-		panic("Error marshaling empty config tx")
-	}
+	logging.SetLevel(logging.DEBUG, "")
 }
 
-type mockConfigManager struct {
-	validated   bool
-	validateErr error
-}
-
-func (mcm *mockConfigManager) Validate(configtx *cb.ConfigurationEnvelope) error {
-	mcm.validated = true
-	return mcm.validateErr
-}
-
-func (mcm *mockConfigManager) Apply(message *cb.ConfigurationEnvelope) error {
-	panic("Unimplemented")
-}
-
-func (mcm *mockConfigManager) ChainID() string {
-	panic("Unimplemented")
-}
-
-type mockConfigFilter struct {
-	manager configtx.Manager
-}
-
-func (mcf *mockConfigFilter) Apply(msg *cb.Envelope) broadcastfilter.Action {
-	payload := &cb.Payload{}
-	err := proto.Unmarshal(msg.Payload, payload)
-	if err != nil {
-		panic(err)
-	}
-	if bytes.Equal(payload.Data, configTx) {
-		if mcf.manager == nil || mcf.manager.Validate(nil) != nil {
-			return broadcastfilter.Reject
-		}
-		return broadcastfilter.Reconfigure
-	}
-	return broadcastfilter.Forward
-}
+var systemChain = "systemChain"
 
 type mockB struct {
 	grpc.ServerStream
@@ -108,66 +63,49 @@ func (m *mockB) Recv() (*cb.Envelope, error) {
 	return msg, nil
 }
 
-type mockMultichainManager struct {
-	chains map[string]*mockChainSupport
+type mockSupportManager struct {
+	chains     map[string]*mockSupport
+	ProcessVal *cb.Envelope
 }
 
-func (mm *mockMultichainManager) GetChain(chainID string) (multichain.ChainSupport, bool) {
+func (mm *mockSupportManager) GetChain(chainID string) (Support, bool) {
 	chain, ok := mm.chains[chainID]
 	return chain, ok
 }
 
-func (mm *mockMultichainManager) halt() {
-	for _, chain := range mm.chains {
-		chain.mockChain.Halt()
+func (mm *mockSupportManager) Process(configTx *cb.Envelope) (*cb.Envelope, error) {
+	if mm.ProcessVal == nil {
+		return nil, fmt.Errorf("Nil result implies error")
 	}
+	return mm.ProcessVal, nil
 }
 
-type mockChainSupport struct {
-	configManager *mockConfigManager
-	filters       *broadcastfilter.RuleSet
-	mockChain     *mockChain
+type mockSupport struct {
+	filters       *filter.RuleSet
+	rejectEnqueue bool
 }
 
-func (mcs *mockChainSupport) ConfigManager() configtx.Manager {
-	return mcs.configManager
+func (ms *mockSupport) Filters() *filter.RuleSet {
+	return ms.filters
 }
 
-func (mcs *mockChainSupport) PolicyManager() policies.Manager {
-	panic("Unimplemented")
+// Enqueue sends a message for ordering
+func (ms *mockSupport) Enqueue(env *cb.Envelope) bool {
+	return !ms.rejectEnqueue
 }
 
-func (mcs *mockChainSupport) Filters() *broadcastfilter.RuleSet {
-	return mcs.filters
-}
-
-func (mcs *mockChainSupport) Reader() rawledger.Reader {
-	panic("Unimplemented")
-}
-
-func (mcs *mockChainSupport) Chain() multichain.Chain {
-	return mcs.mockChain
-}
-
-type mockChain struct {
-	queue chan *cb.Envelope
-	done  bool
-}
-
-func (mc *mockChain) Enqueue(env *cb.Envelope) bool {
-	mc.queue <- env
-	return !mc.done
-}
-
-func (mc *mockChain) Start() {
-	panic("Unimplemented")
-}
-
-func (mc *mockChain) Halt() {
-	mc.done = true
-	select {
-	case <-mc.queue:
-	default:
+func makeConfigMessage(chainID string) *cb.Envelope {
+	payload := &cb.Payload{
+		Data: utils.MarshalOrPanic(&cb.ConfigEnvelope{}),
+		Header: &cb.Header{
+			ChannelHeader: utils.MarshalOrPanic(&cb.ChannelHeader{
+				ChannelId: chainID,
+				Type:      int32(cb.HeaderType_CONFIG_UPDATE),
+			}),
+		},
+	}
+	return &cb.Envelope{
+		Payload: utils.MarshalOrPanic(payload),
 	}
 }
 
@@ -175,48 +113,41 @@ func makeMessage(chainID string, data []byte) *cb.Envelope {
 	payload := &cb.Payload{
 		Data: data,
 		Header: &cb.Header{
-			ChainHeader: &cb.ChainHeader{
-				ChainID: chainID,
-			},
+			ChannelHeader: utils.MarshalOrPanic(&cb.ChannelHeader{
+				ChannelId: chainID,
+			}),
 		},
 	}
-	data, err := proto.Marshal(payload)
-	if err != nil {
-		panic(err)
+	return &cb.Envelope{
+		Payload: utils.MarshalOrPanic(payload),
 	}
-	env := &cb.Envelope{
-		Payload: data,
-	}
-	return env
 }
 
-func getMultichainManager() *mockMultichainManager {
-	cm := &mockConfigManager{}
-	filters := broadcastfilter.NewRuleSet([]broadcastfilter.Rule{
-		broadcastfilter.EmptyRejectRule,
-		&mockConfigFilter{cm},
-		broadcastfilter.AcceptRule,
+func getMockSupportManager() (*mockSupportManager, *mockSupport) {
+	filters := filter.NewRuleSet([]filter.Rule{
+		filter.EmptyRejectRule,
+		filter.AcceptRule,
 	})
-	mc := &mockChain{queue: make(chan *cb.Envelope)}
-	mm := &mockMultichainManager{
-		chains: make(map[string]*mockChainSupport),
+	mm := &mockSupportManager{
+		chains: make(map[string]*mockSupport),
 	}
-	mm.chains[string(systemChain)] = &mockChainSupport{
-		filters:       filters,
-		configManager: cm,
-		mockChain:     mc,
+	mSysChain := &mockSupport{
+		filters: filters,
 	}
-	return mm
+	mm.chains[string(systemChain)] = mSysChain
+	return mm, mSysChain
 }
 
-func TestQueueOverflow(t *testing.T) {
-	mm := getMultichainManager()
-	defer mm.halt()
-	bh := NewHandlerImpl(2, mm)
+func TestEnqueueFailure(t *testing.T) {
+	mm, mSysChain := getMockSupportManager()
+	bh := NewHandlerImpl(mm)
 	m := newMockB()
 	defer close(m.recvChan)
-	b := newBroadcaster(bh.(*handlerImpl))
-	go b.queueEnvelopes(m)
+	done := make(chan struct{})
+	go func() {
+		bh.Handle(m)
+		close(done)
+	}()
 
 	for i := 0; i < 2; i++ {
 		m.recvChan <- makeMessage(systemChain, []byte("Some bytes"))
@@ -226,52 +157,30 @@ func TestQueueOverflow(t *testing.T) {
 		}
 	}
 
+	mSysChain.rejectEnqueue = true
 	m.recvChan <- makeMessage(systemChain, []byte("Some bytes"))
 	reply := <-m.sendChan
 	if reply.Status != cb.Status_SERVICE_UNAVAILABLE {
 		t.Fatalf("Should not have successfully queued the message")
 	}
 
-}
-
-func TestMultiQueueOverflow(t *testing.T) {
-	mm := getMultichainManager()
-	defer mm.halt()
-	bh := NewHandlerImpl(2, mm)
-	ms := []*mockB{newMockB(), newMockB(), newMockB()}
-
-	for _, m := range ms {
-		defer close(m.recvChan)
-		b := newBroadcaster(bh.(*handlerImpl))
-		go b.queueEnvelopes(m)
-	}
-
-	for _, m := range ms {
-		for i := 0; i < 2; i++ {
-			m.recvChan <- makeMessage(systemChain, []byte("Some bytes"))
-			reply := <-m.sendChan
-			if reply.Status != cb.Status_SUCCESS {
-				t.Fatalf("Should have successfully queued the message")
-			}
-		}
-	}
-
-	for _, m := range ms {
-		m.recvChan <- makeMessage(systemChain, []byte("Some bytes"))
-		reply := <-m.sendChan
-		if reply.Status != cb.Status_SERVICE_UNAVAILABLE {
-			t.Fatalf("Should not have successfully queued the message")
-		}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("Should have terminated the stream")
 	}
 }
 
 func TestEmptyEnvelope(t *testing.T) {
-	mm := getMultichainManager()
-	defer mm.halt()
-	bh := NewHandlerImpl(2, mm)
+	mm, _ := getMockSupportManager()
+	bh := NewHandlerImpl(mm)
 	m := newMockB()
 	defer close(m.recvChan)
-	go bh.Handle(m)
+	done := make(chan struct{})
+	go func() {
+		bh.Handle(m)
+		close(done)
+	}()
 
 	m.recvChan <- &cb.Envelope{}
 	reply := <-m.sendChan
@@ -279,41 +188,59 @@ func TestEmptyEnvelope(t *testing.T) {
 		t.Fatalf("Should have rejected the null message")
 	}
 
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("Should have terminated the stream")
+	}
 }
 
-func TestReconfigureAccept(t *testing.T) {
-	mm := getMultichainManager()
-	defer mm.halt()
-	bh := NewHandlerImpl(2, mm)
+func TestBadChannelId(t *testing.T) {
+	mm, _ := getMockSupportManager()
+	bh := NewHandlerImpl(mm)
+	m := newMockB()
+	defer close(m.recvChan)
+	done := make(chan struct{})
+	go func() {
+		bh.Handle(m)
+		close(done)
+	}()
+
+	m.recvChan <- makeMessage("Wrong chain", []byte("Some bytes"))
+	reply := <-m.sendChan
+	if reply.Status != cb.Status_NOT_FOUND {
+		t.Fatalf("Should have rejected message to a chain which does not exist")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("Should have terminated the stream")
+	}
+}
+
+func TestGoodConfigUpdate(t *testing.T) {
+	mm, _ := getMockSupportManager()
+	mm.ProcessVal = &cb.Envelope{Payload: utils.MarshalOrPanic(&cb.Payload{Header: &cb.Header{ChannelHeader: utils.MarshalOrPanic(&cb.ChannelHeader{ChannelId: systemChain})}})}
+	bh := NewHandlerImpl(mm)
+	m := newMockB()
+	defer close(m.recvChan)
+	go bh.Handle(m)
+	newChannelId := "New Chain"
+
+	m.recvChan <- makeConfigMessage(newChannelId)
+	reply := <-m.sendChan
+	assert.Equal(t, cb.Status_SUCCESS, reply.Status, "Should have allowed a good CONFIG_UPDATE")
+}
+
+func TestBadConfigUpdate(t *testing.T) {
+	mm, _ := getMockSupportManager()
+	bh := NewHandlerImpl(mm)
 	m := newMockB()
 	defer close(m.recvChan)
 	go bh.Handle(m)
 
-	m.recvChan <- makeMessage(systemChain, configTx)
-
+	m.recvChan <- makeConfigMessage(systemChain)
 	reply := <-m.sendChan
-	if reply.Status != cb.Status_SUCCESS {
-		t.Fatalf("Should have successfully queued the message")
-	}
-
-	if !mm.chains[string(systemChain)].configManager.validated {
-		t.Errorf("ConfigTx should have been validated before processing")
-	}
-}
-
-func TestReconfigureReject(t *testing.T) {
-	mm := getMultichainManager()
-	mm.chains[string(systemChain)].configManager.validateErr = fmt.Errorf("Fail to validate")
-	defer mm.halt()
-	bh := NewHandlerImpl(2, mm)
-	m := newMockB()
-	defer close(m.recvChan)
-	go bh.Handle(m)
-
-	m.recvChan <- makeMessage(systemChain, configTx)
-
-	reply := <-m.sendChan
-	if reply.Status != cb.Status_BAD_REQUEST {
-		t.Fatalf("Should have failed to queue the message because it was invalid config")
-	}
+	assert.NotEqual(t, cb.Status_SUCCESS, reply.Status, "Should have rejected CONFIG_UPDATE")
 }

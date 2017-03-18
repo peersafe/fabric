@@ -17,23 +17,30 @@ limitations under the License.
 package multichain
 
 import (
+	"github.com/hyperledger/fabric/common/config"
+	"github.com/hyperledger/fabric/common/crypto"
+	"github.com/hyperledger/fabric/common/policies"
+	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/orderer/common/blockcutter"
-	"github.com/hyperledger/fabric/orderer/common/broadcastfilter"
-	"github.com/hyperledger/fabric/orderer/common/configtx"
-	"github.com/hyperledger/fabric/orderer/common/policies"
-	"github.com/hyperledger/fabric/orderer/common/sharedconfig"
-	"github.com/hyperledger/fabric/orderer/rawledger"
+	"github.com/hyperledger/fabric/orderer/common/broadcast"
+	"github.com/hyperledger/fabric/orderer/common/configtxfilter"
+	"github.com/hyperledger/fabric/orderer/common/filter"
+	"github.com/hyperledger/fabric/orderer/common/sigfilter"
+	"github.com/hyperledger/fabric/orderer/common/sizefilter"
+	"github.com/hyperledger/fabric/orderer/ledger"
 	cb "github.com/hyperledger/fabric/protos/common"
+	"github.com/hyperledger/fabric/protos/utils"
 )
-
-const XXXBatchSize = 10 // XXX
 
 // Consenter defines the backing ordering mechanism
 type Consenter interface {
 	// HandleChain should create a return a reference to a Chain for the given set of resources
-	// It will only be invoked for a given chain once per process.  See the description of Chain
-	// for more details
-	HandleChain(configManager configtx.Manager, cutter blockcutter.Receiver, rl rawledger.Writer, metadata []byte) Chain
+	// It will only be invoked for a given chain once per process.  In general, errors will be treated
+	// as irrecoverable and cause system shutdown.  See the description of Chain for more details
+	// The second argument to HandleChain is a pointer to the metadata stored on the `ORDERER` slot of
+	// the last block committed to the ledger of this Chain.  For a new chain, this metadata will be
+	// nil, as this field is not set on the genesis block
+	HandleChain(support ConsenterSupport, metadata *cb.Metadata) (Chain, error)
 }
 
 // Chain defines a way to inject messages for ordering
@@ -55,61 +62,105 @@ type Chain interface {
 	Halt()
 }
 
+// ConsenterSupport provides the resources available to a Consenter implementation
+type ConsenterSupport interface {
+	crypto.LocalSigner
+	BlockCutter() blockcutter.Receiver
+	SharedConfig() config.Orderer
+	CreateNextBlock(messages []*cb.Envelope) *cb.Block
+	WriteBlock(block *cb.Block, committers []filter.Committer, encodedMetadataValue []byte) *cb.Block
+	ChainID() string // ChainID returns the chain ID this specific consenter instance is associated with
+}
+
 // ChainSupport provides a wrapper for the resources backing a chain
 type ChainSupport interface {
-	// ConfigManager returns the current config for the chain
-	ConfigManager() configtx.Manager
+	// This interface is actually the union with the deliver.Support but because of a golang
+	// limitation https://github.com/golang/go/issues/6977 the methods must be explicitly declared
 
-	// PolicyManager returns the current policy manager as specified by the chain configuration
+	// PolicyManager returns the current policy manager as specified by the chain config
 	PolicyManager() policies.Manager
 
-	// Filters returns the set of broadcast filters for this chain
-	Filters() *broadcastfilter.RuleSet
-
 	// Reader returns the chain Reader for the chain
-	Reader() rawledger.Reader
+	Reader() ledger.Reader
 
-	// Chain returns the consenter backed chain
-	Chain() Chain
+	broadcast.Support
+	ConsenterSupport
+
+	// ProposeConfigUpdate applies a CONFIG_UPDATE to an existing config to produce a *cb.ConfigEnvelope
+	ProposeConfigUpdate(env *cb.Envelope) (*cb.ConfigEnvelope, error)
 }
 
 type chainSupport struct {
+	*ledgerResources
 	chain         Chain
-	configManager configtx.Manager
-	policyManager policies.Manager
-	reader        rawledger.Reader
-	writer        rawledger.Writer
-	filters       *broadcastfilter.RuleSet
+	cutter        blockcutter.Receiver
+	filters       *filter.RuleSet
+	signer        crypto.LocalSigner
+	lastConfig    uint64
+	lastConfigSeq uint64
 }
 
-func newChainSupport(configManager configtx.Manager, policyManager policies.Manager, backing rawledger.ReadWriter, sharedConfigManager sharedconfig.Manager, consenters map[string]Consenter) *chainSupport {
-	batchSize := sharedConfigManager.BatchSize()
-	filters := createBroadcastRuleset(configManager)
-	cutter := blockcutter.NewReceiverImpl(batchSize, filters, configManager)
-	consenterType := sharedConfigManager.ConsensusType()
+func newChainSupport(
+	filters *filter.RuleSet,
+	ledgerResources *ledgerResources,
+	consenters map[string]Consenter,
+	signer crypto.LocalSigner,
+) *chainSupport {
+
+	cutter := blockcutter.NewReceiverImpl(ledgerResources.SharedConfig(), filters)
+	consenterType := ledgerResources.SharedConfig().ConsensusType()
 	consenter, ok := consenters[consenterType]
 	if !ok {
 		logger.Fatalf("Error retrieving consenter of type: %s", consenterType)
 	}
 
 	cs := &chainSupport{
-		configManager: configManager,
-		policyManager: policyManager,
-		filters:       filters,
-		reader:        backing,
-		writer:        newWriteInterceptor(configManager, backing),
+		ledgerResources: ledgerResources,
+		cutter:          cutter,
+		filters:         filters,
+		signer:          signer,
 	}
 
-	cs.chain = consenter.HandleChain(configManager, cutter, cs.writer, nil)
+	var err error
+
+	lastBlock := ledger.GetBlock(cs.Reader(), cs.Reader().Height()-1)
+	metadata, err := utils.GetMetadataFromBlock(lastBlock, cb.BlockMetadataIndex_ORDERER)
+	// Assuming a block created with cb.NewBlock(), this should not
+	// error even if the orderer metadata is an empty byte slice
+	if err != nil {
+		logger.Fatalf("Error extracting orderer metadata for chain %x: %s", cs.ChainID(), err)
+	}
+	logger.Debugf("Retrieved metadata for tip of chain (block #%d): %+v", cs.Reader().Height()-1, metadata)
+
+	cs.chain, err = consenter.HandleChain(cs, metadata)
+	if err != nil {
+		logger.Fatalf("Error creating consenter for chain %x: %s", ledgerResources.ChainID(), err)
+	}
 
 	return cs
 }
 
-func createBroadcastRuleset(configManager configtx.Manager) *broadcastfilter.RuleSet {
-	return broadcastfilter.NewRuleSet([]broadcastfilter.Rule{
-		broadcastfilter.EmptyRejectRule,
-		// configfilter.New(configManager),
-		broadcastfilter.AcceptRule,
+// createStandardFilters creates the set of filters for a normal (non-system) chain
+func createStandardFilters(ledgerResources *ledgerResources) *filter.RuleSet {
+	return filter.NewRuleSet([]filter.Rule{
+		filter.EmptyRejectRule,
+		sizefilter.MaxBytesRule(ledgerResources.SharedConfig().BatchSize().AbsoluteMaxBytes),
+		sigfilter.New(policies.ChannelWriters, ledgerResources.PolicyManager()),
+		configtxfilter.NewFilter(ledgerResources),
+		filter.AcceptRule,
+	})
+
+}
+
+// createSystemChainFilters creates the set of filters for the ordering system chain
+func createSystemChainFilters(ml *multiLedger, ledgerResources *ledgerResources) *filter.RuleSet {
+	return filter.NewRuleSet([]filter.Rule{
+		filter.EmptyRejectRule,
+		sizefilter.MaxBytesRule(ledgerResources.SharedConfig().BatchSize().AbsoluteMaxBytes),
+		sigfilter.New(policies.ChannelWriters, ledgerResources.PolicyManager()),
+		newSystemChainFilter(ledgerResources, ml),
+		configtxfilter.NewFilter(ledgerResources),
+		filter.AcceptRule,
 	})
 }
 
@@ -117,37 +168,93 @@ func (cs *chainSupport) start() {
 	cs.chain.Start()
 }
 
-func (cs *chainSupport) ConfigManager() configtx.Manager {
-	return cs.configManager
+func (cs *chainSupport) NewSignatureHeader() (*cb.SignatureHeader, error) {
+	return cs.signer.NewSignatureHeader()
 }
 
-func (cs *chainSupport) PolicyManager() policies.Manager {
-	return cs.policyManager
+func (cs *chainSupport) Sign(message []byte) ([]byte, error) {
+	return cs.signer.Sign(message)
 }
 
-func (cs *chainSupport) Filters() *broadcastfilter.RuleSet {
+func (cs *chainSupport) Filters() *filter.RuleSet {
 	return cs.filters
 }
 
-func (cs *chainSupport) Reader() rawledger.Reader {
-	return cs.reader
+func (cs *chainSupport) BlockCutter() blockcutter.Receiver {
+	return cs.cutter
 }
 
-func (cs *chainSupport) Chain() Chain {
-	return cs.chain
+func (cs *chainSupport) Reader() ledger.Reader {
+	return cs.ledger
 }
 
-type writeInterceptor struct {
-	backing rawledger.Writer
+func (cs *chainSupport) Enqueue(env *cb.Envelope) bool {
+	return cs.chain.Enqueue(env)
 }
 
-// TODO ultimately set write interception policy by config
-func newWriteInterceptor(configManager configtx.Manager, backing rawledger.Writer) *writeInterceptor {
-	return &writeInterceptor{
-		backing: backing,
+func (cs *chainSupport) CreateNextBlock(messages []*cb.Envelope) *cb.Block {
+	return ledger.CreateNextBlock(cs.ledger, messages)
+}
+
+func (cs *chainSupport) addBlockSignature(block *cb.Block) {
+	logger.Debugf("%+v", cs)
+	logger.Debugf("%+v", cs.signer)
+
+	blockSignature := &cb.MetadataSignature{
+		SignatureHeader: utils.MarshalOrPanic(utils.NewSignatureHeaderOrPanic(cs.signer)),
 	}
+
+	// Note, this value is intentionally nil, as this metadata is only about the signature, there is no additional metadata
+	// information required beyond the fact that the metadata item is signed.
+	blockSignatureValue := []byte(nil)
+
+	blockSignature.Signature = utils.SignOrPanic(cs.signer, util.ConcatenateBytes(blockSignatureValue, blockSignature.SignatureHeader, block.Header.Bytes()))
+
+	block.Metadata.Metadata[cb.BlockMetadataIndex_SIGNATURES] = utils.MarshalOrPanic(&cb.Metadata{
+		Value: blockSignatureValue,
+		Signatures: []*cb.MetadataSignature{
+			blockSignature,
+		},
+	})
 }
 
-func (wi *writeInterceptor) Append(blockContents []*cb.Envelope, metadata [][]byte) *cb.Block {
-	return wi.backing.Append(blockContents, metadata)
+func (cs *chainSupport) addLastConfigSignature(block *cb.Block) {
+	configSeq := cs.Sequence()
+	if configSeq > cs.lastConfigSeq {
+		cs.lastConfig = block.Header.Number
+		cs.lastConfigSeq = configSeq
+	}
+
+	lastConfigSignature := &cb.MetadataSignature{
+		SignatureHeader: utils.MarshalOrPanic(utils.NewSignatureHeaderOrPanic(cs.signer)),
+	}
+
+	lastConfigValue := utils.MarshalOrPanic(&cb.LastConfig{Index: cs.lastConfig})
+
+	lastConfigSignature.Signature = utils.SignOrPanic(cs.signer, util.ConcatenateBytes(lastConfigValue, lastConfigSignature.SignatureHeader, block.Header.Bytes()))
+
+	block.Metadata.Metadata[cb.BlockMetadataIndex_LAST_CONFIG] = utils.MarshalOrPanic(&cb.Metadata{
+		Value: lastConfigValue,
+		Signatures: []*cb.MetadataSignature{
+			lastConfigSignature,
+		},
+	})
+}
+
+func (cs *chainSupport) WriteBlock(block *cb.Block, committers []filter.Committer, encodedMetadataValue []byte) *cb.Block {
+	for _, committer := range committers {
+		committer.Commit()
+	}
+	// Set the orderer-related metadata field
+	if encodedMetadataValue != nil {
+		block.Metadata.Metadata[cb.BlockMetadataIndex_ORDERER] = utils.MarshalOrPanic(&cb.Metadata{Value: encodedMetadataValue})
+	}
+	cs.addBlockSignature(block)
+	cs.addLastConfigSignature(block)
+
+	err := cs.ledger.Append(block)
+	if err != nil {
+		logger.Panicf("Could not append block: %s", err)
+	}
+	return block
 }

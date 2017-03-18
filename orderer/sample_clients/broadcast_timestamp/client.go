@@ -17,33 +17,37 @@ limitations under the License.
 package main
 
 import (
+	"flag"
 	"fmt"
 	"time"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/hyperledger/fabric/orderer/common/bootstrap/static"
+	"github.com/hyperledger/fabric/common/configtx/tool/provisional"
 	"github.com/hyperledger/fabric/orderer/localconfig"
 	cb "github.com/hyperledger/fabric/protos/common"
 	ab "github.com/hyperledger/fabric/protos/orderer"
+	"github.com/hyperledger/fabric/protos/utils"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
 
 type broadcastClient struct {
-	client ab.AtomicBroadcast_BroadcastClient
+	client  ab.AtomicBroadcast_BroadcastClient
+	chainID string
 }
 
 // newBroadcastClient creates a simple instance of the broadcastClient interface
-func newBroadcastClient(client ab.AtomicBroadcast_BroadcastClient) *broadcastClient {
-	return &broadcastClient{client: client}
+func newBroadcastClient(client ab.AtomicBroadcast_BroadcastClient, chainID string) *broadcastClient {
+	return &broadcastClient{client: client, chainID: chainID}
 }
 
 func (s *broadcastClient) broadcast(transaction []byte) error {
 	payload, err := proto.Marshal(&cb.Payload{
 		Header: &cb.Header{
-			ChainHeader: &cb.ChainHeader{
-				ChainID: static.TestChainID,
-			},
+			ChannelHeader: utils.MarshalOrPanic(&cb.ChannelHeader{
+				ChannelId: s.chainID,
+			}),
+			SignatureHeader: utils.MarshalOrPanic(&cb.SignatureHeader{}),
 		},
 		Data: transaction,
 	})
@@ -66,9 +70,20 @@ func (s *broadcastClient) getAck() error {
 
 func main() {
 	config := config.Load()
-	serverAddr := fmt.Sprintf("%s:%d", config.General.ListenAddress, config.General.ListenPort)
+
+	var chainID string
+	var serverAddr string
+	var messages uint64
+
+	flag.StringVar(&serverAddr, "server", fmt.Sprintf("%s:%d", config.General.ListenAddress, config.General.ListenPort), "The RPC server to connect to.")
+	flag.StringVar(&chainID, "chainID", provisional.TestChainID, "The chain ID to broadcast to.")
+	flag.Uint64Var(&messages, "messages", 1, "The number of messages to braodcast.")
+	flag.Parse()
+
 	conn, err := grpc.Dial(serverAddr, grpc.WithInsecure())
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 	if err != nil {
 		fmt.Println("Error connecting:", err)
 		return
@@ -79,9 +94,11 @@ func main() {
 		return
 	}
 
-	s := newBroadcastClient(client)
-	s.broadcast([]byte(fmt.Sprintf("Testing %v", time.Now())))
-	err = s.getAck()
+	s := newBroadcastClient(client, chainID)
+	for i := uint64(0); i < messages; i++ {
+		s.broadcast([]byte(fmt.Sprintf("Testing %v", time.Now())))
+		err = s.getAck()
+	}
 	if err != nil {
 		fmt.Printf("\nError: %v\n", err)
 	}

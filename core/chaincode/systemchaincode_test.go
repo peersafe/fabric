@@ -18,24 +18,38 @@ package chaincode
 
 import (
 	"net"
+	"os"
 	"testing"
 	"time"
 
-	"github.com/hyperledger/fabric/core/ledger/kvledger"
-	"github.com/hyperledger/fabric/core/system_chaincode/samplesyscc"
-	"github.com/hyperledger/fabric/core/util"
+	"github.com/hyperledger/fabric/common/util"
+	"github.com/hyperledger/fabric/core/common/ccprovider"
+	"github.com/hyperledger/fabric/core/peer"
+	"github.com/hyperledger/fabric/core/scc"
+	"github.com/hyperledger/fabric/core/scc/samplesyscc"
 	pb "github.com/hyperledger/fabric/protos/peer"
 	"github.com/spf13/viper"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
 
-// Test deploy of a transaction.
-func TestExecuteDeploySysChaincode(t *testing.T) {
+type oldSysCCInfo struct {
+	origSystemCC       []*scc.SystemChaincode
+	origSysCCWhitelist map[string]string
+}
+
+func (osyscc *oldSysCCInfo) reset() {
+	scc.MockResetSysCCs(osyscc.origSystemCC)
+	viper.Set("chaincode.system", osyscc.origSysCCWhitelist)
+}
+
+func initSysCCTests() (*oldSysCCInfo, net.Listener, error) {
 	var opts []grpc.ServerOption
 	grpcServer := grpc.NewServer(opts...)
-	viper.Set("peer.fileSystemPath", "/var/hyperledger/test/tmpdb")
-	kvledger.Initialize("/var/hyperledger/test/tmpdb")
+	viper.Set("peer.fileSystemPath", "/tmp/hyperledger/test/tmpdb")
+	defer os.RemoveAll("/tmp/hyperledger/test/tmpdb")
+
+	peer.MockInitialize()
 
 	//use a different address than what we usually use for "peer"
 	//we override the peerAddress set in chaincode_support.go
@@ -43,13 +57,11 @@ func TestExecuteDeploySysChaincode(t *testing.T) {
 	peerAddress := "0.0.0.0:21726"
 	lis, err := net.Listen("tcp", peerAddress)
 	if err != nil {
-		t.Fail()
-		t.Logf("Error starting peer listener %s", err)
-		return
+		return nil, nil, err
 	}
 
 	getPeerEndpoint := func() (*pb.PeerEndpoint, error) {
-		return &pb.PeerEndpoint{ID: &pb.PeerID{Name: "testpeer"}, Address: peerAddress}, nil
+		return &pb.PeerEndpoint{Id: &pb.PeerID{Name: "testpeer"}, Address: peerAddress}, nil
 	}
 
 	ccStartupTimeout := time.Duration(5000) * time.Millisecond
@@ -57,53 +69,140 @@ func TestExecuteDeploySysChaincode(t *testing.T) {
 
 	go grpcServer.Serve(lis)
 
-	var ctxt = context.Background()
-
 	//set systemChaincodes to sample
-	systemChaincodes = []*SystemChaincode{
+	sysccs := []*scc.SystemChaincode{
 		{
 			Enabled:   true,
 			Name:      "sample_syscc",
-			Path:      "github.com/hyperledger/fabric/core/system_chaincode/samplesyscc",
+			Path:      "github.com/hyperledger/fabric/core/scc/samplesyscc",
 			InitArgs:  [][]byte{},
 			Chaincode: &samplesyscc.SampleSysCC{},
 		},
 	}
 
+	sysccinfo := &oldSysCCInfo{origSysCCWhitelist: viper.GetStringMapString("chaincode.system")}
+
 	// System chaincode has to be enabled
 	viper.Set("chaincode.system", map[string]string{"sample_syscc": "true"})
 
-	chainID := util.GetTestChainID()
+	sysccinfo.origSystemCC = scc.MockRegisterSysCCs(sysccs)
 
-	RegisterSysCCs(chainID)
+	/////^^^ system initialization completed ^^^
+	return sysccinfo, lis, nil
+}
 
-	url := "github.com/hyperledger/fabric/core/system_chaincode/sample_syscc"
+func deploySampleSysCC(t *testing.T, ctxt context.Context, chainID string) error {
+	scc.DeploySysCCs(chainID)
+
+	defer scc.DeDeploySysCCs(chainID)
+
+	url := "github.com/hyperledger/fabric/core/scc/sample_syscc"
+
+	sysCCVers := util.GetSysCCVersion()
+
 	f := "putval"
 	args := util.ToChaincodeArgs(f, "greeting", "hey there")
 
-	spec := &pb.ChaincodeSpec{Type: 1, ChaincodeID: &pb.ChaincodeID{Name: "sample_syscc", Path: url}, CtorMsg: &pb.ChaincodeInput{Args: args}}
-	_, _, _, err = invoke(ctxt, chainID, spec)
+	spec := &pb.ChaincodeSpec{Type: 1, ChaincodeId: &pb.ChaincodeID{Name: "sample_syscc", Path: url, Version: sysCCVers}, Input: &pb.ChaincodeInput{Args: args}}
+	var nextBlockNumber uint64
+	_, _, _, err := invokeWithVersion(ctxt, chainID, sysCCVers, spec, nextBlockNumber)
+	nextBlockNumber++
+
+	cccid := ccprovider.NewCCContext(chainID, "sample_syscc", sysCCVers, "", true, nil, nil)
+	cdsforStop := &pb.ChaincodeDeploymentSpec{ExecEnv: 1, ChaincodeSpec: spec}
 	if err != nil {
-		closeListenerAndSleep(lis)
-		t.Fail()
+		theChaincodeSupport.Stop(ctxt, cccid, cdsforStop)
 		t.Logf("Error invoking sample_syscc: %s", err)
-		return
+		return err
 	}
 
 	f = "getval"
 	args = util.ToChaincodeArgs(f, "greeting")
-	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeID: &pb.ChaincodeID{Name: "sample_syscc", Path: url}, CtorMsg: &pb.ChaincodeInput{Args: args}}
-	_, _, _, err = invoke(ctxt, chainID, spec)
+	spec = &pb.ChaincodeSpec{Type: 1, ChaincodeId: &pb.ChaincodeID{Name: "sample_syscc", Path: url, Version: sysCCVers}, Input: &pb.ChaincodeInput{Args: args}}
+	_, _, _, err = invokeWithVersion(ctxt, chainID, sysCCVers, spec, nextBlockNumber)
 	if err != nil {
-		closeListenerAndSleep(lis)
-		t.Fail()
+		theChaincodeSupport.Stop(ctxt, cccid, cdsforStop)
 		t.Logf("Error invoking sample_syscc: %s", err)
+		return err
+	}
+
+	theChaincodeSupport.Stop(ctxt, cccid, cdsforStop)
+
+	return nil
+}
+
+// Test deploy of a transaction.
+func TestExecuteDeploySysChaincode(t *testing.T) {
+	sysccinfo, lis, err := initSysCCTests()
+	if err != nil {
+		t.Fail()
 		return
 	}
 
-	cds := &pb.ChaincodeDeploymentSpec{ExecEnv: 1, ChaincodeSpec: &pb.ChaincodeSpec{Type: 1, ChaincodeID: &pb.ChaincodeID{Name: "sample_syscc", Path: url}, CtorMsg: &pb.ChaincodeInput{Args: args}}}
+	defer func() {
+		sysccinfo.reset()
+	}()
 
-	theChaincodeSupport.Stop(ctxt, cds)
+	chainID := util.GetTestChainID()
+
+	if err = peer.MockCreateChain(chainID); err != nil {
+		closeListenerAndSleep(lis)
+		return
+	}
+
+	var ctxt = context.Background()
+
+	err = deploySampleSysCC(t, ctxt, chainID)
+	if err != nil {
+		closeListenerAndSleep(lis)
+		t.Fail()
+		return
+	}
+
+	closeListenerAndSleep(lis)
+}
+
+// Test multichains
+func TestMultichains(t *testing.T) {
+	sysccinfo, lis, err := initSysCCTests()
+	if err != nil {
+		t.Fail()
+		return
+	}
+
+	defer func() {
+		sysccinfo.reset()
+	}()
+
+	chainID := "chain1"
+
+	if err = peer.MockCreateChain(chainID); err != nil {
+		closeListenerAndSleep(lis)
+		return
+	}
+
+	var ctxt = context.Background()
+
+	err = deploySampleSysCC(t, ctxt, chainID)
+	if err != nil {
+		closeListenerAndSleep(lis)
+		t.Fail()
+		return
+	}
+
+	chainID = "chain2"
+
+	if err = peer.MockCreateChain(chainID); err != nil {
+		closeListenerAndSleep(lis)
+		return
+	}
+
+	err = deploySampleSysCC(t, ctxt, chainID)
+	if err != nil {
+		closeListenerAndSleep(lis)
+		t.Fail()
+		return
+	}
 
 	closeListenerAndSleep(lis)
 }

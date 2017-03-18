@@ -17,110 +17,64 @@ limitations under the License.
 package integration
 
 import (
-	"bytes"
-	"fmt"
+	"crypto/tls"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/hyperledger/fabric/gossip/comm"
+	"github.com/hyperledger/fabric/gossip/api"
 	"github.com/hyperledger/fabric/gossip/gossip"
-	"github.com/hyperledger/fabric/gossip/proto"
+	"github.com/hyperledger/fabric/gossip/identity"
+	"github.com/hyperledger/fabric/gossip/util"
+	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 )
 
-// This file is used to bootstrap a gossip instance for integration/demo purposes ONLY
+// This file is used to bootstrap a gossip instance and/or leader election service instance
 
-func newConfig(selfEndpoint string, bootPeers ...string) *gossip.Config {
+func newConfig(selfEndpoint string, externalEndpoint string, bootPeers ...string) *gossip.Config {
 	port, err := strconv.ParseInt(strings.Split(selfEndpoint, ":")[1], 10, 64)
 	if err != nil {
 		panic(err)
 	}
-	return &gossip.Config{
-		BindPort:       int(port),
-		BootstrapPeers: bootPeers,
-		ID:             selfEndpoint,
-		MaxMessageCountToStore:     100,
-		MaxPropagationBurstLatency: time.Millisecond * 50,
-		MaxPropagationBurstSize:    3,
-		PropagateIterations:        1,
-		PropagatePeerNum:           3,
-		PullInterval:               time.Second * 5,
-		PullPeerNum:                3,
-		SelfEndpoint:               selfEndpoint,
-	}
-}
 
-func newComm(selfEndpoint string, s *grpc.Server, dialOpts ...grpc.DialOption) comm.Comm {
-	comm, err := comm.NewCommInstance(s, NewGossipCryptoService(), []byte(selfEndpoint), dialOpts...)
-	if err != nil {
-		panic(err)
+	var cert *tls.Certificate
+	if viper.GetBool("peer.tls.enabled") {
+		certTmp, err := tls.LoadX509KeyPair(viper.GetString("peer.tls.cert.file"), viper.GetString("peer.tls.key.file"))
+		if err != nil {
+			panic(err)
+		}
+		cert = &certTmp
 	}
-	return comm
+
+	return &gossip.Config{
+		BindPort:                   int(port),
+		BootstrapPeers:             bootPeers,
+		ID:                         selfEndpoint,
+		MaxBlockCountToStore:       util.GetIntOrDefault("peer.gossip.maxBlockCountToStore", 100),
+		MaxPropagationBurstLatency: util.GetDurationOrDefault("peer.gossip.maxPropagationBurstLatency", 10*time.Millisecond),
+		MaxPropagationBurstSize:    util.GetIntOrDefault("peer.gossip.maxPropagationBurstSize", 10),
+		PropagateIterations:        util.GetIntOrDefault("peer.gossip.propagateIterations", 1),
+		PropagatePeerNum:           util.GetIntOrDefault("peer.gossip.propagatePeerNum", 3),
+		PullInterval:               util.GetDurationOrDefault("peer.gossip.pullInterval", 4*time.Second),
+		PullPeerNum:                util.GetIntOrDefault("peer.gossip.pullPeerNum", 3),
+		InternalEndpoint:           selfEndpoint,
+		ExternalEndpoint:           externalEndpoint,
+		PublishCertPeriod:          util.GetDurationOrDefault("peer.gossip.publishCertPeriod", 10*time.Second),
+		RequestStateInfoInterval:   util.GetDurationOrDefault("peer.gossip.requestStateInfoInterval", 4*time.Second),
+		PublishStateInfoInterval:   util.GetDurationOrDefault("peer.gossip.publishStateInfoInterval", 4*time.Second),
+		SkipBlockVerification:      viper.GetBool("peer.gossip.skipBlockVerification"),
+		TLSServerCert:              cert,
+	}
 }
 
 // NewGossipComponent creates a gossip component that attaches itself to the given gRPC server
-func NewGossipComponent(endpoint string, s *grpc.Server, bootPeers ...string) (gossip.Gossip, comm.Comm) {
-	conf := newConfig(endpoint, bootPeers...)
-	comm := newComm(endpoint, s, grpc.WithInsecure())
-	return gossip.NewGossipService(conf, comm, NewGossipCryptoService()), comm
-}
+func NewGossipComponent(peerIdentity []byte, endpoint string, s *grpc.Server, secAdv api.SecurityAdvisor, cryptSvc api.MessageCryptoService, idMapper identity.Mapper, dialOpts []grpc.DialOption, bootPeers ...string) gossip.Gossip {
 
-// GossipCryptoService is an interface that conforms to both
-// the comm.SecurityProvider and to discovery.CryptoService
-type GossipCryptoService interface {
+	externalEndpoint := viper.GetString("peer.gossip.externalEndpoint")
 
-	// isEnabled returns whether authentication is enabled
-	IsEnabled() bool
+	conf := newConfig(endpoint, externalEndpoint, bootPeers...)
+	gossipInstance := gossip.NewGossipService(conf, s, secAdv, cryptSvc, idMapper, peerIdentity, dialOpts...)
 
-	// Sign signs msg with this peers signing key and outputs
-	// the signature if no error occurred.
-	Sign(msg []byte) ([]byte, error)
-
-	// Verify checks that signature if a valid signature of message under vkID's verification key.
-	// If the verification succeeded, Verify returns nil meaning no error occurred.
-	// If vkID is nil, then the signature is verified against this validator's verification key.
-	Verify(vkID, signature, message []byte) error
-
-	// validateAliveMsg validates that an Alive message is authentic
-	ValidateAliveMsg(*proto.AliveMessage) bool
-
-	// SignMessage signs an AliveMessage and updates its signature field
-	SignMessage(*proto.AliveMessage) *proto.AliveMessage
-}
-
-// NewGossipCryptoService returns an instance that implements naively every security
-// interface that the gossip layer needs
-func NewGossipCryptoService() GossipCryptoService {
-	return &naiveCryptoServiceImpl{}
-}
-
-type naiveCryptoServiceImpl struct {
-}
-
-func (cs *naiveCryptoServiceImpl) ValidateAliveMsg(*proto.AliveMessage) bool {
-	return true
-}
-
-// SignMessage signs an AliveMessage and updates its signature field
-func (cs *naiveCryptoServiceImpl) SignMessage(msg *proto.AliveMessage) *proto.AliveMessage {
-	return msg
-}
-
-// IsEnabled returns true whether authentication is enabled
-func (cs *naiveCryptoServiceImpl) IsEnabled() bool {
-	return false
-}
-
-// Sign signs a message with the local peer's private key
-func (cs *naiveCryptoServiceImpl) Sign(msg []byte) ([]byte, error) {
-	return msg, nil
-}
-
-// Verify verifies a signature on a message that came from a peer with a certain vkID
-func (cs *naiveCryptoServiceImpl) Verify(vkID, signature, message []byte) error {
-	if !bytes.Equal(signature, message) {
-		return fmt.Errorf("Invalid signature!")
-	}
-	return nil
+	return gossipInstance
 }

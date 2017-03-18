@@ -2,12 +2,10 @@
 **Note:** This is a **read-only mirror** of the formal [Gerrit](https://gerrit.hyperledger.org/r/#/admin/projects/fabric) repository,
 where active development is ongoing. Issue tracking is handled in [Jira](https://jira.hyperledger.org/secure/RapidBoard.jspa?projectKey=FAB&rapidView=5&view=planning)
 
-## Incubation Notice
+## Status
 
-This project is a Hyperledger project in _Incubation_. It was proposed to the
-community and documented [here](https://goo.gl/RYQZ5N). Information on what
-_Incubation_ entails can be found in the [Hyperledger Project Lifecycle
-document](https://goo.gl/4edNRc).
+This project is an _Active_ Hyperledger project. For more information on the history of this project see the [Fabric wiki page](https://wiki.hyperledger.org/projects/fabric.md#history). Information on what _Active_ entails can be found in
+the [Hyperledger Project Lifecycle document](https://wiki.hyperledger.org/community/project-lifecycle).
 
 [![Build Status](https://jenkins.hyperledger.org/buildStatus/icon?job=fabric-merge-x86_64)](https://jenkins.hyperledger.org/view/fabric/job/fabric-merge-x86_64/)
 [![Go Report Card](https://goreportcard.com/badge/github.com/hyperledger/fabric)](https://goreportcard.com/report/github.com/hyperledger/fabric)
@@ -38,13 +36,13 @@ Full details of how to contribute to this project are documented [here](http://h
 
 [Hyperledger mailing lists and archives](http://lists.hyperledger.org/)
 
-[Hyperledger Slack](http://hyperledgerproject.slack.com) - if you need an invitation, try our [Slack inviter](https://slack.hyperledger.org)
+[Hyperledger Chat](http://chat.hyperledger.org/channel/fabric)
 
-[Hyperledger Wiki](https://github.com/hyperledger/hyperledger/wiki)
+[Hyperledger Wiki](https://wiki.hyperledger.org/)
 
-[Hyperledger Code of Conduct](https://github.com/hyperledger/hyperledger/wiki/Hyperledger-Project-Code-of-Conduct)
+[Hyperledger Code of Conduct](https://wiki.hyperledger.org/community/hyperledger-project-code-of-conduct)
 
-[Community Calendar](https://github.com/hyperledger/hyperledger/wiki/PublicMeetingCalendar)
+[Community Calendar](https://wiki.hyperledger.org/community/calendar-public-meetings)
 
 ## License <a name="license"></a>
 The Hyperledger Project uses the [Apache License Version 2.0](LICENSE) software

@@ -84,24 +84,21 @@ func (s *SBFT) handleCheckpoint(c *Checkpoint, src uint64) {
 		cp := s.cur.checkpoint[r]
 		cpset[r] = cp.Signature
 	}
-	s.cur.checkpointDone = true
 
 	c = s.cur.checkpoint[replicas[0]]
 
 	if !reflect.DeepEqual(c.Digest, s.cur.subject.Digest) {
-		log.Fatalf("replica %d: weak checkpoint %x does not match our state %x",
-			s.id, c.Digest, s.cur.subject.Digest)
-		// NOT REACHED
+		log.Warningf("replica %d: weak checkpoint %x does not match our state %x --- primary %d of view %d is probably Byzantine, sending view change",
+			s.id, c.Digest, s.cur.subject.Digest, s.primaryID(), s.view)
+		s.sendViewChange()
+		return
 	}
 
 	// ignore null requests
 	batch := *s.cur.preprep.Batch
 	batch.Signatures = cpset
-	s.deliverBatch(&batch)
-
-	s.cur.timeout.Cancel()
-	log.Infof("replica %d: request %s %s completed on %d", s.id, s.cur.subject.Seq, hash2str(s.cur.subject.Digest), s.id)
-
+	s.deliverBatch(&batch, s.cur.committers)
+	log.Infof("replica %d: request %s %s delivered on %d (completed common case)", s.id, s.cur.subject.Seq, hash2str(s.cur.subject.Digest), s.id)
 	s.maybeSendNextBatch()
 	s.processBacklog()
 }

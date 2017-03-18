@@ -1,3 +1,19 @@
+/*
+Copyright DTCC 2016 All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+         http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package java
 
 import (
@@ -7,72 +23,38 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"strings"
 
+	"errors"
+
 	"github.com/golang/protobuf/proto"
-	cutil "github.com/hyperledger/fabric/core/container/util"
-	"github.com/hyperledger/fabric/core/util"
+	"github.com/hyperledger/fabric/common/util"
+	ccutil "github.com/hyperledger/fabric/core/chaincode/platforms/util"
 	pb "github.com/hyperledger/fabric/protos/peer"
+	logging "github.com/op/go-logging"
 )
 
-//hashFilesInDir computes h=hash(h,file bytes) for each file in a directory
-//Directory entries are traversed recursively. In the end a single
-//hash value is returned for the entire directory structure
-func hashFilesInDir(cutoff string, dir string, hash []byte, tw *tar.Writer) ([]byte, error) {
-	//ReadDir returns sorted list of files in dir
-	fis, err := ioutil.ReadDir(dir)
-	if err != nil {
-		return hash, fmt.Errorf("ReadDir failed %s\n", err)
-	}
-	for _, fi := range fis {
-		name := fmt.Sprintf("%s/%s", dir, fi.Name())
-		if fi.IsDir() {
-			var err error
-			hash, err = hashFilesInDir(cutoff, name, hash, tw)
-			if err != nil {
-				return hash, err
-			}
-			continue
-		}
-		buf, err := ioutil.ReadFile(name)
-		if err != nil {
-			fmt.Printf("Error reading %s\n", err)
-			return hash, err
-		}
-
-		newSlice := make([]byte, len(hash)+len(buf))
-		copy(newSlice[len(buf):], hash[:])
-		//hash = md5.Sum(newSlice)
-		hash = util.ComputeCryptoHash(newSlice)
-
-		if tw != nil {
-			is := bytes.NewReader(buf)
-			if err = cutil.WriteStreamToPackage(is, name, name[len(cutoff):], tw); err != nil {
-				return hash, fmt.Errorf("Error adding file to tar %s", err)
-			}
-		}
-	}
-	return hash, nil
-}
-
-func isCodeExist(tmppath string) error {
-	file, err := os.Open(tmppath)
-	if err != nil {
-		return fmt.Errorf("Download failer %s", err)
-	}
-	fi, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("could not stat file %s", err)
-	}
-	if !fi.IsDir() {
-		return fmt.Errorf("file %s is not dir\n", file.Name())
-	}
-	return nil
-}
+var logger = logging.MustGetLogger("java/hash")
 
 func getCodeFromHTTP(path string) (codegopath string, err error) {
-	//TODO
-	return "", nil
+
+	codegopath, err = ioutil.TempDir("", "javachaincode")
+
+	if err != nil {
+		return "", fmt.Errorf("Error creating temporary file: %s", err)
+	}
+	var out bytes.Buffer
+
+	cmd := exec.Command("git", "clone", path, codegopath)
+	cmd.Stderr = &out
+	cmderr := cmd.Run()
+	if cmderr != nil {
+		return "", fmt.Errorf("Error cloning git repository %s", cmderr)
+	}
+
+	return codegopath, nil
+
 }
 
 //collectChaincodeFiles collects chaincode files and generates hashcode for the
@@ -80,20 +62,15 @@ func getCodeFromHTTP(path string) (codegopath string, err error) {
 //NOTE: for dev mode, user builds and runs chaincode manually. The name provided
 //by the user is equivalent to the path. This method will treat the name
 //as codebytes and compute the hash from it. ie, user cannot run the chaincode
-//with the same (name, ctor, args)
+//with the same (name, input, args)
 func collectChaincodeFiles(spec *pb.ChaincodeSpec, tw *tar.Writer) (string, error) {
 	if spec == nil {
-		return "", fmt.Errorf("Cannot collect chaincode files from nil spec")
+		return "", errors.New("Cannot collect chaincode files from nil spec")
 	}
 
-	chaincodeID := spec.ChaincodeID
+	chaincodeID := spec.ChaincodeId
 	if chaincodeID == nil || chaincodeID.Path == "" {
-		return "", fmt.Errorf("Cannot collect chaincode files from empty chaincode path")
-	}
-
-	ctor := spec.CtorMsg
-	if ctor == nil || len(ctor.Args) == 0 {
-		return "", fmt.Errorf("Cannot collect chaincode files from empty ctor")
+		return "", errors.New("Cannot collect chaincode files from empty chaincode path")
 	}
 
 	codepath := chaincodeID.Path
@@ -106,13 +83,9 @@ func collectChaincodeFiles(spec *pb.ChaincodeSpec, tw *tar.Writer) (string, erro
 	}()
 
 	var err error
-	if strings.HasPrefix(codepath, "http://") {
+	if strings.HasPrefix(codepath, "http://") ||
+		strings.HasPrefix(codepath, "https://") {
 		ishttp = true
-		codepath = codepath[7:]
-		codepath, err = getCodeFromHTTP(codepath)
-	} else if strings.HasPrefix(codepath, "https://") {
-		ishttp = true
-		codepath = codepath[8:]
 		codepath, err = getCodeFromHTTP(codepath)
 	} else if !strings.HasPrefix(codepath, "/") {
 		wd := ""
@@ -124,22 +97,24 @@ func collectChaincodeFiles(spec *pb.ChaincodeSpec, tw *tar.Writer) (string, erro
 		return "", fmt.Errorf("Error getting code %s", err)
 	}
 
-	if err = isCodeExist(codepath); err != nil {
+	if err = ccutil.IsCodeExist(codepath); err != nil {
 		return "", fmt.Errorf("code does not exist %s", err)
 	}
 
-	root := codepath
-	if strings.LastIndex(root, "/") == len(root)-1 {
-		root = root[:len(root)-1]
-	}
-	root = root[:strings.LastIndex(root, "/")+1]
-	ctorbytes, err := proto.Marshal(ctor)
-	if err != nil {
-		return "", fmt.Errorf("Error marshalling constructor: %s", err)
-	}
-	hash := util.GenerateHashFromSignature(codepath, ctorbytes)
+	var hash []byte
 
-	hash, err = hashFilesInDir(root, codepath, hash, tw)
+	//install will not have inputs and we don't have to collect hash for it
+	if spec.Input == nil || len(spec.Input.Args) == 0 {
+		logger.Debugf("not using input for hash computation for %v ", chaincodeID)
+	} else {
+		inputbytes, err2 := proto.Marshal(spec.Input)
+		if err2 != nil {
+			return "", fmt.Errorf("Error marshalling constructor: %s", err)
+		}
+		hash = util.GenerateHashFromSignature(codepath, inputbytes)
+	}
+
+	hash, err = ccutil.HashFilesInDir("", codepath, hash, tw)
 	if err != nil {
 		return "", fmt.Errorf("Could not get hashcode for %s - %s\n", codepath, err)
 	}

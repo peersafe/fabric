@@ -20,44 +20,33 @@ import (
 	"testing"
 
 	"github.com/Shopify/sarama"
+	"github.com/hyperledger/fabric/common/configtx/tool/provisional"
+	"github.com/hyperledger/fabric/orderer/localconfig"
+	"github.com/hyperledger/fabric/orderer/mocks/util"
+	"github.com/stretchr/testify/assert"
 )
 
-func TestStaticPartitioner(t *testing.T) {
-
-	var partition int32 = 3
-	var numberOfPartitions int32 = 6
-
-	partitionerConstructor := newStaticPartitioner(partition)
-	partitioner := partitionerConstructor(testConf.Kafka.Topic)
-
-	for i := 0; i < 10; i++ {
-		assignedPartition, err := partitioner.Partition(new(sarama.ProducerMessage), numberOfPartitions)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if assignedPartition != partition {
-			t.Fatalf("Expected: %v. Actual: %v", partition, assignedPartition)
-		}
-	}
-}
-
 func TestProducerConfigMessageMaxBytes(t *testing.T) {
-
-	topic := testConf.Kafka.Topic
-
-	broker := sarama.NewMockBroker(t, 1000)
+	broker := sarama.NewMockBroker(t, 1)
+	defer func() {
+		broker.Close()
+	}()
 	broker.SetHandlerByMap(map[string]sarama.MockResponse{
 		"MetadataRequest": sarama.NewMockMetadataResponse(t).
 			SetBroker(broker.Addr(), broker.BrokerID()).
-			SetLeader(topic, 0, broker.BrokerID()),
+			SetLeader(cp.Topic(), cp.Partition(), broker.BrokerID()),
 		"ProduceRequest": sarama.NewMockProduceResponse(t),
 	})
 
-	config := newBrokerConfig(testConf)
+	mockTLS := config.TLS{Enabled: false}
+	config := newBrokerConfig(testConf.Kafka.Version, rawPartition, mockTLS)
 	producer, err := sarama.NewSyncProducer([]string{broker.Addr()}, config)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		producer.Close()
+	}()
 
 	testCases := []struct {
 		name string
@@ -70,56 +59,142 @@ func TestProducerConfigMessageMaxBytes(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, err = producer.SendMessage(&sarama.ProducerMessage{Topic: topic, Value: sarama.ByteEncoder(make([]byte, tc.size))})
+			_, _, err = producer.SendMessage(&sarama.ProducerMessage{
+				Topic: cp.Topic(),
+				Value: sarama.ByteEncoder(make([]byte, tc.size)),
+			})
 			if err != tc.err {
 				t.Fatal(err)
 			}
 		})
 
 	}
-
-	producer.Close()
-	broker.Close()
 }
 
 func TestNewBrokerConfig(t *testing.T) {
+	// Use a partition ID that is not the 'default' (rawPartition)
+	var differentPartition int32 = 2
+	cp = newChainPartition(provisional.TestChainID, differentPartition)
 
-	topic := testConf.Kafka.Topic
-
-	// use a partition id that is not the 'default' 0
-	var partition int32 = 2
-	originalPartitionID := testConf.Kafka.PartitionID
+	// Setup a mock broker that reports that it has 3 partitions for the topic
+	broker := sarama.NewMockBroker(t, 1)
 	defer func() {
-		testConf.Kafka.PartitionID = originalPartitionID
+		broker.Close()
 	}()
-	testConf.Kafka.PartitionID = partition
-
-	// setup a mock broker that reports that it has 3 partitions for the topic
-	broker := sarama.NewMockBroker(t, 1000)
 	broker.SetHandlerByMap(map[string]sarama.MockResponse{
 		"MetadataRequest": sarama.NewMockMetadataResponse(t).
 			SetBroker(broker.Addr(), broker.BrokerID()).
-			SetLeader(topic, 0, broker.BrokerID()).
-			SetLeader(topic, 1, broker.BrokerID()).
-			SetLeader(topic, 2, broker.BrokerID()),
+			SetLeader(cp.Topic(), 0, broker.BrokerID()).
+			SetLeader(cp.Topic(), 1, broker.BrokerID()).
+			SetLeader(cp.Topic(), 2, broker.BrokerID()),
 		"ProduceRequest": sarama.NewMockProduceResponse(t),
 	})
 
-	config := newBrokerConfig(testConf)
+	config := newBrokerConfig(testConf.Kafka.Version, differentPartition, config.TLS{Enabled: false})
 	producer, err := sarama.NewSyncProducer([]string{broker.Addr()}, config)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("Failed to create producer:", err)
 	}
+	defer func() {
+		producer.Close()
+	}()
 
 	for i := 0; i < 10; i++ {
-		assignedPartition, _, err := producer.SendMessage(&sarama.ProducerMessage{Topic: topic})
+		assignedPartition, _, err := producer.SendMessage(&sarama.ProducerMessage{Topic: cp.Topic()})
 		if err != nil {
-			t.Fatal(err)
+			t.Fatal("Failed to send message:", err)
 		}
-		if assignedPartition != partition {
-			t.Fatalf("Expected: %v. Actual: %v", partition, assignedPartition)
+		if assignedPartition != differentPartition {
+			t.Fatalf("Message wasn't posted to the right partition - expected: %d, got %v", differentPartition, assignedPartition)
 		}
 	}
-	producer.Close()
-	broker.Close()
+}
+
+func TestTLSConfigEnabled(t *testing.T) {
+	publicKey, privateKey, err := util.GenerateMockPublicPrivateKeyPairPEM(false)
+	if err != nil {
+		t.Fatalf("Enable to generate a public/private key pair: %v", err)
+	}
+	caPublicKey, _, err := util.GenerateMockPublicPrivateKeyPairPEM(true)
+	if err != nil {
+		t.Fatalf("Enable to generate a signer certificate: %v", err)
+	}
+
+	config := newBrokerConfig(testConf.Kafka.Version, 0, config.TLS{
+		Enabled:     true,
+		PrivateKey:  privateKey,
+		Certificate: publicKey,
+		RootCAs:     []string{caPublicKey},
+	})
+
+	assert.True(t, config.Net.TLS.Enable)
+	assert.NotNil(t, config.Net.TLS.Config)
+	assert.Len(t, config.Net.TLS.Config.Certificates, 1)
+	assert.Len(t, config.Net.TLS.Config.RootCAs.Subjects(), 1)
+	assert.Equal(t, uint16(0), config.Net.TLS.Config.MaxVersion)
+	assert.Equal(t, uint16(0), config.Net.TLS.Config.MinVersion)
+}
+
+func TestTLSConfigDisabled(t *testing.T) {
+	publicKey, privateKey, err := util.GenerateMockPublicPrivateKeyPairPEM(false)
+	if err != nil {
+		t.Fatalf("Enable to generate a public/private key pair: %v", err)
+	}
+	caPublicKey, _, err := util.GenerateMockPublicPrivateKeyPairPEM(true)
+	if err != nil {
+		t.Fatalf("Enable to generate a signer certificate: %v", err)
+	}
+
+	config := newBrokerConfig(testConf.Kafka.Version, 0, config.TLS{
+		Enabled:     false,
+		PrivateKey:  privateKey,
+		Certificate: publicKey,
+		RootCAs:     []string{caPublicKey},
+	})
+
+	assert.False(t, config.Net.TLS.Enable)
+	assert.Zero(t, config.Net.TLS.Config)
+
+}
+
+func TestTLSConfigBadCert(t *testing.T) {
+	publicKey, privateKey, err := util.GenerateMockPublicPrivateKeyPairPEM(false)
+	if err != nil {
+		t.Fatalf("Enable to generate a public/private key pair: %v", err)
+	}
+	caPublicKey, _, err := util.GenerateMockPublicPrivateKeyPairPEM(true)
+	if err != nil {
+		t.Fatalf("Enable to generate a signer certificate: %v", err)
+	}
+
+	t.Run("BadPrivateKey", func(t *testing.T) {
+		assert.Panics(t, func() {
+			newBrokerConfig(testConf.Kafka.Version, 0, config.TLS{
+				Enabled:     true,
+				PrivateKey:  privateKey,
+				Certificate: "TRASH",
+				RootCAs:     []string{caPublicKey},
+			})
+		})
+	})
+	t.Run("BadPublicKey", func(t *testing.T) {
+		assert.Panics(t, func() {
+			newBrokerConfig(testConf.Kafka.Version, 0, config.TLS{
+				Enabled:     true,
+				PrivateKey:  "TRASH",
+				Certificate: publicKey,
+				RootCAs:     []string{caPublicKey},
+			})
+		})
+	})
+	t.Run("BadRootCAs", func(t *testing.T) {
+		assert.Panics(t, func() {
+			newBrokerConfig(testConf.Kafka.Version, 0, config.TLS{
+				Enabled:     true,
+				PrivateKey:  privateKey,
+				Certificate: publicKey,
+				RootCAs:     []string{"TRASH"},
+			})
+		})
+	})
 }

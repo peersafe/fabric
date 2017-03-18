@@ -19,7 +19,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -29,20 +28,20 @@ import (
 
 	_ "net/http/pprof"
 
+	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/core"
-	"github.com/hyperledger/fabric/core/crypto/primitives"
-	"github.com/hyperledger/fabric/flogging"
-	"github.com/hyperledger/fabric/msp"
 	"github.com/hyperledger/fabric/peer/chaincode"
+	"github.com/hyperledger/fabric/peer/channel"
 	"github.com/hyperledger/fabric/peer/clilogging"
+	"github.com/hyperledger/fabric/peer/common"
 	"github.com/hyperledger/fabric/peer/node"
 	"github.com/hyperledger/fabric/peer/version"
 )
 
 var logger = logging.MustGetLogger("main")
+var logOutput = os.Stderr
 
 // Constants go here.
-const fabric = "hyperledger"
 const cmdRoot = "core"
 
 // The main command describes the service and
@@ -51,7 +50,7 @@ var mainCmd = &cobra.Command{
 	Use: "peer",
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		peerCommand := getPeerCommandFromCobraCommand(cmd)
-		flogging.LoggingInit(peerCommand)
+		flogging.InitFromViper(peerCommand)
 
 		return core.CacheConfiguration()
 	},
@@ -84,54 +83,29 @@ func main() {
 	testCoverProfile := ""
 	mainFlags.StringVarP(&testCoverProfile, "test.coverprofile", "", "coverage.cov", "Done")
 
-	var alternativeCfgPath = os.Getenv("PEER_CFG_PATH")
-	if alternativeCfgPath != "" {
-		logger.Infof("User defined config file path: %s", alternativeCfgPath)
-		viper.AddConfigPath(alternativeCfgPath) // Path to look for the config file in
-	} else {
-		viper.AddConfigPath("./") // Path to look for the config file in
-		// Path to look for the config file in based on GOPATH
-		gopath := os.Getenv("GOPATH")
-		for _, p := range filepath.SplitList(gopath) {
-			peerpath := filepath.Join(p, "src/github.com/hyperledger/fabric/peer")
-			viper.AddConfigPath(peerpath)
-		}
-	}
-
-	// Now set the configuration file.
-	viper.SetConfigName(cmdRoot) // Name of config file (without extension)
-
-	err := viper.ReadInConfig() // Find and read the config file
-	if err != nil {             // Handle errors reading the config file
-		panic(fmt.Errorf("Fatal error when reading %s config file: %s\n", cmdRoot, err))
+	err := common.InitConfig(cmdRoot)
+	if err != nil { // Handle errors reading the config file
+		panic(fmt.Errorf("Fatal error when initializing %s config : %s\n", cmdRoot, err))
 	}
 
 	mainCmd.AddCommand(version.Cmd())
 	mainCmd.AddCommand(node.Cmd())
-	mainCmd.AddCommand(chaincode.Cmd())
+	mainCmd.AddCommand(chaincode.Cmd(nil))
 	mainCmd.AddCommand(clilogging.Cmd())
+	mainCmd.AddCommand(channel.Cmd(nil))
 
 	runtime.GOMAXPROCS(viper.GetInt("peer.gomaxprocs"))
 
-	// Init the crypto layer
-	//TODO: integrate new crypto / idp code
-	primitives.SetSecurityLevel("SHA2", 256)
+	// initialize logging format from core.yaml
+	flogging.SetLoggingFormat(viper.GetString("logging.format"), logOutput)
 
 	// Init the MSP
-	// TODO: determine the location of this config file
-	var mspMgrConfigFile string
-	if alternativeCfgPath != "" {
-		mspMgrConfigFile = alternativeCfgPath + "/msp/peer-config.json"
-	} else if _, err := os.Stat("./peer-config.json"); err == nil {
-		mspMgrConfigFile = "./peer-config.json"
-	} else {
-		mspMgrConfigFile = os.Getenv("GOPATH") + "/src/github.com/hyperledger/fabric/msp/peer-config.json"
+	var mspMgrConfigDir = viper.GetString("peer.mspConfigPath")
+	var mspID = viper.GetString("peer.localMspId")
+	err = common.InitCrypto(mspMgrConfigDir, mspID)
+	if err != nil { // Handle errors reading the config file
+		panic(err.Error())
 	}
-	err = msp.GetManager().Setup(mspMgrConfigFile)
-	if err != nil {
-		panic(fmt.Errorf("Fatal error when reading MSP config file %s: err %s\n", mspMgrConfigFile, err))
-	}
-
 	// On failure Cobra prints the usage message and error string, so we only
 	// need to exit with a non-0 status
 	if mainCmd.Execute() != nil {

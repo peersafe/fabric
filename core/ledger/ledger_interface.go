@@ -17,57 +17,58 @@ limitations under the License.
 package ledger
 
 import (
+	commonledger "github.com/hyperledger/fabric/common/ledger"
 	"github.com/hyperledger/fabric/protos/common"
-	pb "github.com/hyperledger/fabric/protos/peer"
+	"github.com/hyperledger/fabric/protos/peer"
 )
 
-// Ledger captures the methods that are common across the 'raw ledger' and the 'final ledger'
-type Ledger interface {
-	// GetBlockchainInfo returns basic info about blockchain
-	GetBlockchainInfo() (*pb.BlockchainInfo, error)
-	// GetBlockchainInfo returns block at a given height
-	GetBlockByNumber(blockNumber uint64) (*common.Block, error)
-	// GetBlocksIterator returns an iterator that starts from `startBlockNumber`(inclusive).
-	// The iterator is a blocking iterator i.e., it blocks till the next block gets available in the ledger
-	// ResultsIterator contains type BlockHolder
-	GetBlocksIterator(startBlockNumber uint64) (ResultsIterator, error)
-	//Prune prunes the blocks/transactions that satisfy the given policy
-	Prune(policy PrunePolicy) error
-	// Close closes the ledger
+// PeerLedgerProvider provides handle to ledger instances
+type PeerLedgerProvider interface {
+	// Create creates a new ledger with a given unique id
+	Create(ledgerID string) (PeerLedger, error)
+	// Open opens an already created ledger
+	Open(ledgerID string) (PeerLedger, error)
+	// Exists tells whether the ledger with given id exists
+	Exists(ledgerID string) (bool, error)
+	// List lists the ids of the existing ledgers
+	List() ([]string, error)
+	// Close closes the PeerLedgerProvider
 	Close()
 }
 
-// RawLedger implements methods required by 'raw ledger'
-type RawLedger interface {
-	Ledger
-	// CommitBlock adds a new block
-	CommitBlock(block *common.Block) error
-}
-
-// ValidatedLedger represents the 'final ledger'. In addition to implement the methods inherited from the Ledger,
-// it provides the handle to objects for querying the state and executing transactions.
-type ValidatedLedger interface {
-	Ledger
+// PeerLedger differs from the OrdererLedger in that PeerLedger locally maintain a bitmask
+// that tells apart valid transactions from invalid ones
+type PeerLedger interface {
+	commonledger.Ledger
 	// GetTransactionByID retrieves a transaction by id
-	GetTransactionByID(txID string) (*pb.Transaction, error)
+	GetTransactionByID(txID string) (*peer.ProcessedTransaction, error)
 	// GetBlockByHash returns a block given it's hash
 	GetBlockByHash(blockHash []byte) (*common.Block, error)
+	// GetBlockByTxID returns a block which contains a transaction
+	GetBlockByTxID(txID string) (*common.Block, error)
 	// NewTxSimulator gives handle to a transaction simulator.
 	// A client can obtain more than one 'TxSimulator's for parallel execution.
 	// Any snapshoting/synchronization should be performed at the implementation level if required
+
+	// GetTxValidationCodeByTxID returns reason code of transaction validation
+	GetTxValidationCodeByTxID(txID string) (peer.TxValidationCode, error)
 	NewTxSimulator() (TxSimulator, error)
-	// NewQueryExecuter gives handle to a query executer.
+	// NewQueryExecutor gives handle to a query executor.
 	// A client can obtain more than one 'QueryExecutor's for parallel execution.
 	// Any synchronization should be performed at the implementation level if required
 	NewQueryExecutor() (QueryExecutor, error)
-	// RemoveInvalidTransactions validates all the transactions in the given block
-	// and returns a block that contains only valid transactions and a list of transactions that are invalid
-	RemoveInvalidTransactionsAndPrepare(block *common.Block) (*common.Block, []*pb.InvalidTransaction, error)
-	// Commit commits the changes prepared in the method RemoveInvalidTransactionsAndPrepare.
-	// Commits both the valid block and related state changes
-	Commit() error
-	// Rollback rollbacks the changes prepared in the method RemoveInvalidTransactionsAndPrepare
-	Rollback()
+	// NewHistoryQueryExecutor gives handle to a history query executor.
+	// A client can obtain more than one 'HistoryQueryExecutor's for parallel execution.
+	// Any synchronization should be performed at the implementation level if required
+	NewHistoryQueryExecutor() (HistoryQueryExecutor, error)
+	//Prune prunes the blocks/transactions that satisfy the given policy
+	Prune(policy commonledger.PrunePolicy) error
+}
+
+// ValidatedLedger represents the 'final ledger' after filtering out invalid transactions from PeerLedger.
+// Post-v1
+type ValidatedLedger interface {
+	commonledger.Ledger
 }
 
 // QueryExecutor executes the queries
@@ -81,15 +82,23 @@ type QueryExecutor interface {
 	// GetStateMultipleKeys gets the values for multiple keys in a single call
 	GetStateMultipleKeys(namespace string, keys []string) ([][]byte, error)
 	// GetStateRangeScanIterator returns an iterator that contains all the key-values between given key ranges.
+	// startKey is included in the results and endKey is excluded. An empty startKey refers to the first available key
+	// and an empty endKey refers to the last available key. For scanning all the keys, both the startKey and the endKey
+	// can be supplied as empty strings. However, a full scan shuold be used judiciously for performance reasons.
 	// The returned ResultsIterator contains results of type *KV
-	GetStateRangeScanIterator(namespace string, startKey string, endKey string) (ResultsIterator, error)
-	// GetTransactionsForKey returns an iterator that contains all the transactions that modified the given key.
-	// The returned ResultsIterator contains results of type *msgs.Transaction
-	GetTransactionsForKey(namespace string, key string) (ResultsIterator, error)
+	GetStateRangeScanIterator(namespace string, startKey string, endKey string) (commonledger.ResultsIterator, error)
 	// ExecuteQuery executes the given query and returns an iterator that contains results of type specific to the underlying data store.
-	ExecuteQuery(query string) (ResultsIterator, error)
+	// Only used for state databases that support query
+	// For a chaincode, the namespace corresponds to the chaincodeId
+	ExecuteQuery(namespace, query string) (commonledger.ResultsIterator, error)
 	// Done releases resources occupied by the QueryExecutor
 	Done()
+}
+
+// HistoryQueryExecutor executes the history queries
+type HistoryQueryExecutor interface {
+	// GetHistoryForKey retrieves the history of values for a key.
+	GetHistoryForKey(namespace string, key string) (commonledger.ResultsIterator, error)
 }
 
 // TxSimulator simulates a transaction on a consistent snapshot of the 'as recent state as possible'
@@ -115,30 +124,22 @@ type TxSimulator interface {
 	GetTxSimulationResults() ([]byte, error)
 }
 
-// ResultsIterator - an iterator for query result set
-type ResultsIterator interface {
-	// Next returns the next item in the result set. The `QueryResult` is expected to be nil when
-	// the iterator gets exhausted
-	Next() (QueryResult, error)
-	// Close releases resources occupied by the iterator
-	Close()
-}
-
-// QueryResult - a general interface for supporting different types of query results. Actual types differ for different queries
-type QueryResult interface{}
-
 // KV - QueryResult for KV-based datamodel. Holds a key and corresponding value. A nil value indicates a non-existent key.
 type KV struct {
 	Key   string
 	Value []byte
 }
 
-// BlockHolder holds block returned by the iterator in GetBlocksIterator.
-// The sole purpose of this holder is to avoid desrialization if block is desired in raw bytes form (e.g., for transfer)
-type BlockHolder interface {
-	GetBlock() *common.Block
-	GetBlockBytes() []byte
+// KeyModification - QueryResult for History.
+type KeyModification struct {
+	TxID  string
+	Value []byte
 }
 
-// PrunePolicy - a general interface for supporting different pruning policies
-type PrunePolicy interface{}
+// QueryRecord - Result structure for query records. Holds a namespace, key and record.
+// Only used for state databases that support query
+type QueryRecord struct {
+	Namespace string
+	Key       string
+	Record    []byte
+}

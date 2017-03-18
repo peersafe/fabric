@@ -17,60 +17,104 @@ limitations under the License.
 package kafka
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"strconv"
+
 	"github.com/Shopify/sarama"
 	"github.com/hyperledger/fabric/orderer/localconfig"
+	ab "github.com/hyperledger/fabric/protos/orderer"
 )
 
-const (
-	ackOutOfRangeError    = "ACK out of range"
-	seekOutOfRangeError   = "Seek out of range"
-	windowOutOfRangeError = "Window out of range"
-)
-
-func newBrokerConfig(conf *config.TopLevel) *sarama.Config {
+func newBrokerConfig(kafkaVersion sarama.KafkaVersion, chosenStaticPartition int32, tlsConfig config.TLS) *sarama.Config {
 	brokerConfig := sarama.NewConfig()
-	brokerConfig.Version = conf.Kafka.Version
-	brokerConfig.Producer.Partitioner = newStaticPartitioner(conf.Kafka.PartitionID)
-	// set equivalent of kafka producer config max.request.bytes to the deafult
-	// value of a kafka server's socket.request.max.bytes property (100MiB).
+
+	brokerConfig.Consumer.Return.Errors = true
+
+	brokerConfig.Net.TLS.Enable = tlsConfig.Enabled
+	if brokerConfig.Net.TLS.Enable {
+		// create public/private key pair structure
+		keyPair, err := tls.X509KeyPair([]byte(tlsConfig.Certificate), []byte(tlsConfig.PrivateKey))
+		if err != nil {
+			panic(fmt.Errorf("Unable to decode public/private key pair. Error: %v", err))
+		}
+		// create root CA pool
+		rootCAs := x509.NewCertPool()
+		for _, certificate := range tlsConfig.RootCAs {
+			if !rootCAs.AppendCertsFromPEM([]byte(certificate)) {
+				panic(fmt.Errorf("Unable to decode certificate. Error: %v", err))
+			}
+		}
+		brokerConfig.Net.TLS.Config = &tls.Config{
+			Certificates: []tls.Certificate{keyPair},
+			RootCAs:      rootCAs,
+			MinVersion:   0, // TLS 1.0 (no SSL support)
+			MaxVersion:   0, // Latest supported TLS version
+		}
+	}
+
+	// Set the level of acknowledgement reliability needed from the broker.
+	// WaitForAll means that the partition leader will wait till all ISRs
+	// got the message before sending back an ACK to the sender.
+	brokerConfig.Producer.RequiredAcks = sarama.WaitForAll
+	// A partitioner is actually not needed the way we do things now,
+	// but we're adding it now to allow for flexibility in the future.
+	brokerConfig.Producer.Partitioner = newStaticPartitioner(chosenStaticPartition)
+	// Set equivalent of Kafka producer config max.request.bytes to the default
+	// value of a Kafka broker's socket.request.max.bytes property (100 MiB).
 	brokerConfig.Producer.MaxMessageBytes = int(sarama.MaxRequestSize)
+
+	brokerConfig.Version = kafkaVersion
+
 	return brokerConfig
 }
 
-func newMsg(payload []byte, topic string) *sarama.ProducerMessage {
+func newConnectMessage() *ab.KafkaMessage {
+	return &ab.KafkaMessage{
+		Type: &ab.KafkaMessage_Connect{
+			Connect: &ab.KafkaMessageConnect{
+				Payload: nil,
+			},
+		},
+	}
+}
+
+func newRegularMessage(payload []byte) *ab.KafkaMessage {
+	return &ab.KafkaMessage{
+		Type: &ab.KafkaMessage_Regular{
+			Regular: &ab.KafkaMessageRegular{
+				Payload: payload,
+			},
+		},
+	}
+}
+
+func newTimeToCutMessage(blockNumber uint64) *ab.KafkaMessage {
+	return &ab.KafkaMessage{
+		Type: &ab.KafkaMessage_TimeToCut{
+			TimeToCut: &ab.KafkaMessageTimeToCut{
+				BlockNumber: blockNumber,
+			},
+		},
+	}
+}
+
+func newProducerMessage(cp ChainPartition, payload []byte) *sarama.ProducerMessage {
 	return &sarama.ProducerMessage{
-		Topic: topic,
+		Topic: cp.Topic(),
+		Key:   sarama.StringEncoder(strconv.Itoa(int(cp.Partition()))), // TODO Consider writing an IntEncoder?
 		Value: sarama.ByteEncoder(payload),
 	}
 }
 
-func newOffsetReq(conf *config.TopLevel, seek int64) *sarama.OffsetRequest {
+func newOffsetReq(cp ChainPartition, offset int64) *sarama.OffsetRequest {
 	req := &sarama.OffsetRequest{}
-	// If seek == -1, ask for the for the offset assigned to next new message
-	// If seek == -2, ask for the earliest available offset
+	// If offset (seek) == -1, ask for the offset assigned to next new message.
+	// If offset (seek) == -2, ask for the earliest available offset.
 	// The last parameter in the AddBlock call is needed for God-knows-why reasons.
 	// From the Kafka folks themselves: "We agree that this API is slightly funky."
 	// https://mail-archives.apache.org/mod_mbox/kafka-users/201411.mbox/%3Cc159383825e04129b77253ffd6c448aa@BY2PR02MB505.namprd02.prod.outlook.com%3E
-	req.AddBlock(conf.Kafka.Topic, conf.Kafka.PartitionID, seek, 1)
+	req.AddBlock(cp.Topic(), cp.Partition(), offset, 1)
 	return req
-}
-
-// newStaticPartitioner returns a PartitionerConstructor that returns a Partitioner
-// that always chooses the specified partition.
-func newStaticPartitioner(partition int32) sarama.PartitionerConstructor {
-	return func(topic string) sarama.Partitioner {
-		return &staticPartitioner{partition}
-	}
-}
-
-type staticPartitioner struct {
-	partitionID int32
-}
-
-func (p *staticPartitioner) Partition(message *sarama.ProducerMessage, numPartitions int32) (int32, error) {
-	return p.partitionID, nil
-}
-
-func (p *staticPartitioner) RequiresConsistency() bool {
-	return true
 }

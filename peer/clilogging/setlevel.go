@@ -17,12 +17,11 @@ limitations under the License.
 package clilogging
 
 import (
-	"fmt"
-
 	"golang.org/x/net/context"
 
-	"github.com/hyperledger/fabric/core/peer"
+	"github.com/hyperledger/fabric/peer/common"
 	pb "github.com/hyperledger/fabric/protos/peer"
+
 	"github.com/spf13/cobra"
 )
 
@@ -45,23 +44,19 @@ func setLevel(cmd *cobra.Command, args []string) (err error) {
 	if err != nil {
 		logger.Warningf("Error: %s", err)
 	} else {
-		clientConn, err := peer.NewPeerClientConnection()
+		adminClient, err := common.GetAdminClient()
 		if err != nil {
-			logger.Infof("Error trying to connect to local peer: %s", err)
-			err = fmt.Errorf("Error trying to connect to local peer: %s", err)
-			fmt.Println(&pb.ServerStatus{Status: pb.ServerStatus_UNKNOWN})
+			logger.Warningf("%s", err)
 			return err
 		}
 
-		serverClient := pb.NewAdminClient(clientConn)
-
-		logResponse, err := serverClient.SetModuleLogLevel(context.Background(), &pb.LogLevelRequest{LogModule: args[0], LogLevel: args[1]})
+		logResponse, err := adminClient.SetModuleLogLevel(context.Background(), &pb.LogLevelRequest{LogModule: args[0], LogLevel: args[1]})
 
 		if err != nil {
-			logger.Warningf("Invalid log level: %s", args[1])
+			logger.Warningf("%s", err)
 			return err
 		}
-		logger.Infof("Log level set for module '%s': %s", logResponse.LogModule, logResponse.LogLevel)
+		logger.Infof("Log level set for peer module '%s': %s", logResponse.LogModule, logResponse.LogLevel)
 	}
 	return err
 }

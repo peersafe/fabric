@@ -16,13 +16,18 @@ limitations under the License.
 
 package kafka
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/hyperledger/fabric/common/configtx/tool/provisional"
+	ab "github.com/hyperledger/fabric/protos/orderer"
+)
 
 func TestConsumerInitWrong(t *testing.T) {
-	cases := []int64{oldestOffset - 1, newestOffset}
+	cases := []int64{testOldestOffset - 1, testNewestOffset}
 
-	for _, seek := range cases {
-		mc, err := mockNewConsumer(t, testConf, seek)
+	for _, offset := range cases {
+		mc, err := mockNewConsumer(t, newChainPartition(provisional.TestChainID, rawPartition), offset, make(chan *ab.KafkaMessage))
 		testClose(t, mc)
 		if err == nil {
 			t.Fatal("Consumer should have failed with out-of-range error")
@@ -31,24 +36,30 @@ func TestConsumerInitWrong(t *testing.T) {
 }
 
 func TestConsumerRecv(t *testing.T) {
-	t.Run("oldest", testConsumerRecvFunc(oldestOffset, oldestOffset))
-	t.Run("in-between", testConsumerRecvFunc(middleOffset, middleOffset))
-	t.Run("newest", testConsumerRecvFunc(newestOffset-1, newestOffset-1))
+	t.Run("oldest", testConsumerRecvFunc(testOldestOffset, testOldestOffset))
+	t.Run("in-between", testConsumerRecvFunc(testMiddleOffset, testMiddleOffset))
+	t.Run("newest", testConsumerRecvFunc(testNewestOffset-1, testNewestOffset-1))
 }
 
 func testConsumerRecvFunc(given, expected int64) func(t *testing.T) {
+	disk := make(chan *ab.KafkaMessage)
 	return func(t *testing.T) {
-		mc, err := mockNewConsumer(t, testConf, given)
+		cp := newChainPartition(provisional.TestChainID, rawPartition)
+		mc, err := mockNewConsumer(t, cp, given, disk)
 		if err != nil {
 			testClose(t, mc)
-			t.Fatalf("Consumer should have proceeded normally: %s", err)
+			t.Fatal("Consumer should have proceeded normally:", err)
 		}
+		<-mc.(*mockConsumerImpl).isSetup
+		go func() {
+			disk <- newRegularMessage([]byte("foo"))
+		}()
 		msg := <-mc.Recv()
-		if (msg.Topic != testConf.Kafka.Topic) ||
-			msg.Partition != testConf.Kafka.PartitionID ||
+		if (msg.Topic != cp.Topic()) ||
+			msg.Partition != cp.Partition() ||
 			msg.Offset != mc.(*mockConsumerImpl).consumedOffset ||
 			msg.Offset != expected {
-			t.Fatalf("Expected block %d, got %d", expected, msg.Offset)
+			t.Fatalf("Expected message with offset %d, got %d", expected, msg.Offset)
 		}
 		testClose(t, mc)
 	}

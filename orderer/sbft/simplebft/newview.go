@@ -45,7 +45,7 @@ func (s *SBFT) maybeSendNewView() {
 
 	var batch *Batch
 	if xset == nil {
-		// no need for batch, it is contained in the vset
+		// no need for batches, it is contained in the vset
 	} else if reflect.DeepEqual(s.cur.subject.Digest, xset.Digest) {
 		batch = s.cur.preprep.Batch
 	} else {
@@ -86,13 +86,22 @@ func (s *SBFT) checkNewViewSignatures(nv *NewView) ([]*ViewChange, error) {
 }
 
 func (s *SBFT) handleNewView(nv *NewView, src uint64) {
-	if src != s.primaryIDView(nv.View) {
-		log.Warningf("replica %d: invalid new view from %d for %d", s.id, src, nv.View)
+	if nv == nil {
 		return
 	}
 
-	if onv := s.replicaState[s.primaryIDView(nv.View)].newview; onv != nil && onv.View >= nv.View {
-		log.Debugf("replica %d: discarding duplicate new view for %d", s.id, nv.View)
+	if nv.View < s.view {
+		log.Debugf("replica %d: discarding old new view from %d for %d, we are in %d", s.id, src, nv.View, s.view)
+		return
+	}
+
+	if nv.View == s.view && s.activeView {
+		log.Debugf("replica %d: discarding new view from %d for %d, we are already active in %d", s.id, src, nv.View, s.view)
+		return
+	}
+
+	if src != s.primaryIDView(nv.View) {
+		log.Warningf("replica %d: invalid new view from %d for %d", s.id, src, nv.View)
 		return
 	}
 
@@ -103,7 +112,7 @@ func (s *SBFT) handleNewView(nv *NewView, src uint64) {
 		return
 	}
 
-	xset, _, ok := s.makeXset(vcs)
+	xset, prevBatch, ok := s.makeXset(vcs)
 
 	if !ok || !reflect.DeepEqual(nv.Xset, xset) {
 		log.Warningf("replica %d: invalid new view from %d: xset incorrect: %v, %v", s.id, src, nv.Xset, xset)
@@ -113,12 +122,12 @@ func (s *SBFT) handleNewView(nv *NewView, src uint64) {
 
 	if nv.Xset == nil {
 		if nv.Batch != nil {
-			log.Warningf("replica %d: invalid new view from %d: null request should come with null batch", s.id, src)
+			log.Warningf("replica %d: invalid new view from %d: null request should come with null batches", s.id, src)
 			s.sendViewChange()
 			return
 		}
 	} else if nv.Batch == nil || !bytes.Equal(nv.Batch.Hash(), nv.Xset.Digest) {
-		log.Warningf("replica %d: invalid new view from %d: batch head hash does not match xset: %x, %x, %v",
+		log.Warningf("replica %d: invalid new view from %d: batches head hash does not match xset: %x, %x, %v",
 			s.id, src, hash(nv.Batch.Header), nv.Xset.Digest, nv)
 		s.sendViewChange()
 		return
@@ -127,79 +136,61 @@ func (s *SBFT) handleNewView(nv *NewView, src uint64) {
 	if nv.Batch != nil {
 		_, err = s.checkBatch(nv.Batch, true, false)
 		if err != nil {
-			log.Warningf("replica %d: invalid new view from %d: invalid batch, %s",
+			log.Warningf("replica %d: invalid new view from %d: invalid batches, %s",
 				s.id, src, err)
 			s.sendViewChange()
 			return
 		}
 	}
 
-	s.replicaState[s.primaryIDView(nv.View)].newview = nv
-
-	if nv.View > s.view {
-		s.view = nv.View
-		s.activeView = false
-	}
-
-	s.processNewView()
-}
-
-func (s *SBFT) processNewView() {
-	if s.activeView {
-		return
-	}
-
-	nv := s.replicaState[s.primaryIDView(s.view)].newview
-	if nv == nil || nv.View != s.view {
-		return
-	}
-
-	s.activeView = true
+	s.view = nv.View
 	s.discardBacklog(s.primaryID())
 
-	s.maybeDeliverUsingXset(nv)
+	// maybe deliver previous batches
+	if s.sys.LastBatch(s.chainId).DecodeHeader().Seq < prevBatch.DecodeHeader().Seq {
+		if prevBatch.DecodeHeader().Seq == s.cur.subject.Seq.Seq {
+			// we just received a signature set for a request which we preprepared, but never delivered.
+			// check first if the locally preprepared request matches the signature set
+			if !reflect.DeepEqual(prevBatch.DecodeHeader().DataHash, s.cur.preprep.Batch.DecodeHeader().DataHash) {
+				log.Warningf("replica %d: [seq %d] request checkpointed in a previous view does not match locally preprepared one, delivering batches without payload", s.id, s.cur.subject.Seq.Seq)
+			} else {
+				log.Debugf("replica %d: [seq %d] request checkpointed in a previous view with matching preprepare, completing and delivering the batches with payload", s.id, s.cur.subject.Seq.Seq)
+				prevBatch.Payloads = s.cur.preprep.Batch.Payloads
+			}
+		}
+		// TODO we should not do this here, as prevBatch was already delivered
+		blockOK, committers := s.getCommittersFromBatch(prevBatch)
+		if !blockOK {
+			log.Panic("Replica %d: our last checkpointed batch is erroneous (block cutter).", s.id)
+		}
+		// TODO what should we do with the remaining?
+		s.deliverBatch(prevBatch, committers)
+	}
 
-	// By now we cannot be waiting for any more outstanding
-	// messages.  after a new-view message, by definition all
-	// activity has acquiesced.  Prepare to accept a new request.
+	// after a new-view message, prepare to accept new requests.
+	s.activeView = true
 	s.cur.checkpointDone = true
 	s.cur.subject.Seq.Seq = 0
 
 	log.Infof("replica %d now active in view %d; primary: %v", s.id, s.view, s.isPrimary())
 
+	//process pre-prepare if piggybacked to new-view
 	if nv.Batch != nil {
 		pp := &Preprepare{
 			Seq:   &SeqView{Seq: nv.Batch.DecodeHeader().Seq, View: s.view},
 			Batch: nv.Batch,
 		}
+		blockOK, committers := s.getCommittersFromBatch(nv.Batch)
+		if !blockOK {
+			log.Debugf("Replica %d: new view %d batch erroneous (block cutter).", s.id, nv.View)
+			s.sendViewChange()
+		}
 
-		s.handleCheckedPreprepare(pp)
+		s.handleCheckedPreprepare(pp, committers)
 	} else {
-		log.Debugf("replica %d: %+v", s.id, s)
 		s.cancelViewChangeTimer()
 		s.maybeSendNextBatch()
 	}
 
 	s.processBacklog()
-}
-
-func (s *SBFT) maybeDeliverUsingXset(nv *NewView) {
-	// TODO we could cache vcs in replicaState
-	vcs, err := s.checkNewViewSignatures(nv)
-	if err != nil {
-		panic(err)
-	}
-
-	_, prevBatch, ok := s.makeXset(vcs)
-	if !ok {
-		panic("invalid newview")
-	}
-	if s.sys.LastBatch().DecodeHeader().Seq < prevBatch.DecodeHeader().Seq {
-		if prevBatch.DecodeHeader().Seq == s.cur.subject.Seq.Seq {
-			// we just received a signature set for a request which we preprepared, but never delivered.
-			prevBatch.Payloads = s.cur.preprep.Batch.Payloads
-		}
-		s.cur.checkpointDone = true
-		s.deliverBatch(prevBatch)
-	}
 }

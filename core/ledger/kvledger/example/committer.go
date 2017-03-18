@@ -20,31 +20,23 @@ import (
 	"github.com/hyperledger/fabric/core/ledger"
 
 	"github.com/hyperledger/fabric/protos/common"
-	pb "github.com/hyperledger/fabric/protos/peer"
 )
 
 // Committer a toy committer
 type Committer struct {
-	ledger ledger.ValidatedLedger
+	ledger ledger.PeerLedger
 }
 
 // ConstructCommitter constructs a committer for the example
-func ConstructCommitter(ledger ledger.ValidatedLedger) *Committer {
+func ConstructCommitter(ledger ledger.PeerLedger) *Committer {
 	return &Committer{ledger}
 }
 
-// CommitBlock commits the block
-func (c *Committer) CommitBlock(rawBlock *common.Block) (*common.Block, []*pb.InvalidTransaction, error) {
-	var validBlock *common.Block
-	var invalidTxs []*pb.InvalidTransaction
-	var err error
+// Commit commits the block
+func (c *Committer) Commit(rawBlock *common.Block) error {
 	logger.Debugf("Committer validating the block...")
-	if validBlock, invalidTxs, err = c.ledger.RemoveInvalidTransactionsAndPrepare(rawBlock); err != nil {
-		return nil, nil, err
+	if err := c.ledger.Commit(rawBlock); err != nil {
+		return err
 	}
-	logger.Debugf("Committer committing the block...")
-	if err = c.ledger.Commit(); err != nil {
-		return nil, nil, err
-	}
-	return validBlock, invalidTxs, err
+	return nil
 }

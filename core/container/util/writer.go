@@ -27,25 +27,17 @@ import (
 	"time"
 
 	"github.com/op/go-logging"
-	"github.com/spf13/viper"
 )
 
 var vmLogger = logging.MustGetLogger("container")
 
-var fileTypes = map[string]bool{
-	".c":    true,
-	".h":    true,
-	".go":   true,
-	".yaml": true,
-	".json": true,
-}
-var javaFileTypes = map[string]bool{
-	".java":       true,
-	".properties": true,
-	".gradle":     true,
+// These filetypes are excluded while creating the tar package sent to Docker
+// Generated .class and other temporary files can be excluded
+var javaExcludeFileTypes = map[string]bool{
+	".class": true,
 }
 
-func WriteFolderToTarPackage(tw *tar.Writer, srcPath string, excludeDir string, includeFileTypeMap map[string]bool) error {
+func WriteFolderToTarPackage(tw *tar.Writer, srcPath string, excludeDir string, includeFileTypeMap map[string]bool, excludeFileTypeMap map[string]bool) error {
 	rootDirectory := srcPath
 	vmLogger.Infof("rootDirectory = %s", rootDirectory)
 
@@ -75,11 +67,20 @@ func WriteFolderToTarPackage(tw *tar.Writer, srcPath string, excludeDir string, 
 		if len(path[rootDirLen:]) == 0 {
 			return nil
 		}
-
-		// we only want 'fileTypes' source files at this point
 		ext := filepath.Ext(path)
-		if _, ok := includeFileTypeMap[ext]; ok != true {
-			return nil
+
+		if includeFileTypeMap != nil {
+			// we only want 'fileTypes' source files at this point
+			if _, ok := includeFileTypeMap[ext]; ok != true {
+				return nil
+			}
+		}
+
+		//exclude the given file types
+		if excludeFileTypeMap != nil {
+			if exclude, ok := excludeFileTypeMap[ext]; ok && exclude {
+				return nil
+			}
 		}
 
 		newPath := fmt.Sprintf("src%s", path[rootDirLen:])
@@ -89,7 +90,6 @@ func WriteFolderToTarPackage(tw *tar.Writer, srcPath string, excludeDir string, 
 		if err != nil {
 			return fmt.Errorf("Error writing file to package: %s", err)
 		}
-
 		return nil
 	}
 
@@ -100,39 +100,12 @@ func WriteFolderToTarPackage(tw *tar.Writer, srcPath string, excludeDir string, 
 	return nil
 }
 
-//WriteGopathSrc tars up files under gopath src
-func WriteGopathSrc(tw *tar.Writer, excludeDir string) error {
-	gopath := os.Getenv("GOPATH")
-	// Only take the first element of GOPATH
-	gopath = filepath.SplitList(gopath)[0]
-
-	rootDirectory := filepath.Join(gopath, "src")
-	vmLogger.Infof("rootDirectory = %s", rootDirectory)
-
-	if err := WriteFolderToTarPackage(tw, rootDirectory, excludeDir, fileTypes); err != nil {
-		vmLogger.Errorf("Error writing folder to tar package %s", err)
-		return err
-	}
-
-	// Add the certificates to tar
-	if viper.GetBool("peer.tls.enabled") {
-		err := WriteFileToPackage(viper.GetString("peer.tls.cert.file"), "src/certs/cert.pem", tw)
-		if err != nil {
-			return fmt.Errorf("Error writing cert file to package: %s", err)
-		}
-	}
-
-	// Write the tar file out
-	if err := tw.Close(); err != nil {
-		return err
-	}
-	//ioutil.WriteFile("/tmp/chaincode_deployment.tar", inputbuf.Bytes(), 0644)
-	return nil
-}
-
+//Package Java project to tar file from the source path
 func WriteJavaProjectToPackage(tw *tar.Writer, srcPath string) error {
 
-	if err := WriteFolderToTarPackage(tw, srcPath, "", javaFileTypes); err != nil {
+	vmLogger.Debugf("Packaging Java project from path %s", srcPath)
+
+	if err := WriteFolderToTarPackage(tw, srcPath, "", nil, javaExcludeFileTypes); err != nil {
 
 		vmLogger.Errorf("Error writing folder to tar package %s", err)
 		return err
@@ -183,6 +156,15 @@ func WriteStreamToPackage(is io.Reader, localpath string, packagepath string, tw
 	if _, err := io.Copy(tw, is); err != nil {
 		return fmt.Errorf("Error copy (path: %s, oldname:%s,newname:%s,sz:%d) : %s", localpath, oldname, packagepath, header.Size, err)
 	}
+
+	return nil
+}
+
+func WriteBytesToPackage(name string, payload []byte, tw *tar.Writer) error {
+	//Make headers identical by using zero time
+	var zeroTime time.Time
+	tw.WriteHeader(&tar.Header{Name: name, Size: int64(len(payload)), ModTime: zeroTime, AccessTime: zeroTime, ChangeTime: zeroTime})
+	tw.Write(payload)
 
 	return nil
 }
